@@ -415,8 +415,8 @@ def numpy_to_quat(arr):
       axis=-1, arr=arr)
 
 def pose_to_numpy(ros_pose):
-  pose_t = vector3_to_numpy(ros_pose.position)
-  pose_q = quat_to_numpy(ros_pose.orientation)
+  pose_t = vector3_to_numpy(ros_pose.pose.position)
+  pose_q = quat_to_numpy(ros_pose.pose.orientation)
   pose_R = Rotation.from_quat(pose_q, scalar_first=False).as_matrix()
   pose_Rt_3x4 = np.concatenate((pose_R, pose_t.reshape(3, 1)), axis=1)
   row = np.array([[0,0,0,1]])

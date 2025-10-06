@@ -1,0 +1,74 @@
+# Configuration for semantic segmentation evaluation on ROS2 Isaac Sim dataset
+# Uses NA-Radio encoder with ROS2 semantic segmentation data
+
+defaults:
+  - default
+  - override dataset: ros2isaacsim_eval
+  - override encoder: naradio
+  - override mapping: semantic_voxel_map
+  - override vis: rerun
+  - _self_
+
+# Choose any suitable folder for saving the results
+eval_out: eval_out/ros2isaacsim
+
+# Evaluation parameters
+load_external_gt: false
+prediction_thresh: 0.1
+prompt_denoising_thresh: 0.5
+k: 0  # 1-to-1 mapping for ROS2 data
+classes_to_ignore: []
+classes_to_eval: []
+
+# Dataset configuration
+# Note: scene_name is not needed for ROS2SemSegSubscriber
+dataset:
+  scene_name: "isaac_sim_robot3"
+
+# Mapping configuration
+mapping:
+  vox_size: 0.05 #5cm voxels
+  vox_accum_period: 4
+  max_pts_per_frame: -1
+
+# Encoder configuration
+encoder:
+  model_version: radio_v2.5-l
+  lang_model: siglip
+
+# Querying configuration
+querying:
+  _target_: rayfronts.querying.naradio.NARadioQuerying
+  text_query_mode: "labels"  # Use "labels" or "prompts"
+  compressed: false
+
+# # Evaluation configuration
+# extras:
+#   eval_out: "eval_out/ros2isaacsim"
+#   no_caching: false
+#   k: 0
+#   prompt_denoising_thresh: 0.5
+#   prediction_thresh: 0.1
+#   classes_to_ignore: []
+#   classes_to_eval: []  # Empty means evaluate all classes
+#   chunk_size: 10000
+#   online_eval_period: -1  # Only evaluate at the end
+#   split_pred_vis: false
+#   load_external_gt: false
+#   load_external_pred: false
+
+# Visualization configuration
+# vis:
+#   _target_: rayfronts.visualizers.rerun.RerunVisualizer
+#   port: 9090
+#   pose_period: 10
+#   input_period: 10
+#   map_period: 50
+
+# Training configuration
+seed: 42
+batch_size: 1
+depth_limit: 10  # No depth limit
+
+# Evaluation period (frames between evaluations)
+# eval_period: 100

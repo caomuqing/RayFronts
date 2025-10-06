@@ -211,10 +211,15 @@ class SemSegEval:
 
     logger.info("Lifting 2D ground truth to 3D voxels...")
     for i, batch in enumerate(self.dataloader):
+      print(f"Processing batch {i}")
       rgb_img = batch["rgb_img"].cuda()
       depth_img = batch["depth_img"].cuda()
       pose_4x4 = batch["pose_4x4"].cuda()
       semseg_img = batch["semseg_img"].cuda()
+      if self.cfg.depth_limit >= 0:
+        depth_img[torch.logical_and(
+          torch.isfinite(depth_img),
+          depth_img > self.cfg.depth_limit)] = torch.inf      
       if self.vis is not None:
         if i % self.cfg.vis.pose_period == 0:
           self.vis.log_pose(batch["pose_4x4"][-1])

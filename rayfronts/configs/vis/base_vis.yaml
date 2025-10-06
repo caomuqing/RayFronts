@@ -1,6 +1,6 @@
 # How often to update the visualization of the map.
 # Set to -1 to disable map visualization.
-map_period: 10
+map_period: 50
 
 # How often to visualize 2D inputs (RGB/depth/feature images).
 # Set to -1 to disable visualizing pose.

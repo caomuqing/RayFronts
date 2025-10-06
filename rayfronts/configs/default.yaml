@@ -19,7 +19,7 @@ batch_size: 1
 
 # Imposing a depth limit on the data such that to test limited depth scenarios
 # Set to a negative number to not use a limit
-depth_limit: -1
+depth_limit: 30
 
 # Which pytorch interpolation mode for rgb and feature interpolation 
 # (Depth and Segmentation always use nearest-exact)
@@ -31,7 +31,7 @@ querying:
   # then every line from the query file is considered as a prompt. If set to 
   # labels then every line will be considered as a label that will be injected 
   # into multiple prompt templates and averaged out to get the text embedding.
-  text_query_mode: null # [null, "labels", "prompts"]
+  text_query_mode: "labels" # [null, "labels", "prompts"]
 
   # Whether to query in compressed feature space or decompress first. Only used
   # if feat_compressor was used.
@@ -45,7 +45,7 @@ querying:
   # exists, the query is assumed to be a text query.
   # .json: A dictionary where the query is the key and the value is a hex
   # color such that the query is colorized using that in the visualization.
-  query_file: null
+  query_file: '/workspace/RayFronts/test.txt'
 
   # Whether softmax probability is computed across queries or not.
   # If you want results to be independent of other queries set this to false.

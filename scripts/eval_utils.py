@@ -55,26 +55,31 @@ def attach_cls_mapping_to_dataset(dataset: datasets.SemSegDataset,
           black_list is None or len(black_list) == 0, \
           "Cannot set both white_list and black_list at the same time"
 
+  # Use CPU device to avoid CUDA issues when GPU is not available
+  device = "cpu"
+  if torch.cuda.is_available():
+    device = "cuda"
+
   if white_list is not None and len(white_list) > 0:
     dataset._cat_index_to_cat_id = torch.tensor(
       sorted([id for id, name in cin.items()
               if name in white_list or id==0]),
-              dtype=torch.long, device="cuda")
+              dtype=torch.long, device=device)
   else:
     if black_list is None:
       black_list = []
     dataset._cat_index_to_cat_id = torch.tensor(
       sorted([id for id, name in cin.items()
               if name not in black_list]),
-              dtype=torch.long, device="cuda")
+              dtype=torch.long, device=device)
 
   dataset._cat_id_to_cat_index = torch.zeros(
     max(dataset.cat_id_to_name.keys())+1,
-    dtype=torch.long, device="cuda")
+    dtype=torch.long, device=device)
 
   dataset._cat_id_to_cat_index[dataset._cat_index_to_cat_id] = \
     torch.arange(len(dataset._cat_index_to_cat_id),
-                 dtype=torch.long, device="cuda")
+                 dtype=torch.long, device=device)
 
   num_classes = len(dataset._cat_index_to_cat_id)
 
@@ -215,7 +220,8 @@ def align_labels_with_knn(xyz1, labels1, xyz2, labels2, k=1):
   # TODO: Replace with FAISS for GPU computation
   ball_tree = BallTree(xyz2.cpu())
 
-  matched_indices = torch.from_numpy(ball_tree.query(xyz1.cpu(), k=k)[1]).cuda()
+  matched_indices = torch.from_numpy(ball_tree.query(xyz1.cpu(), k=k)[1])
+  matched_indices = matched_indices.to(xyz1.device)
   aligned_labels2_k = labels2[matched_indices]
   aligned_labels2 = torch.mode(aligned_labels2_k, dim=-1).values
 
