@@ -167,15 +167,10 @@ class Ros2Subscriber(PosedRgbdDataset):
           self._rosnode, msg_str_to_type[msg_str], t, qos_profile = 10)
     self._frame_msgs_queue = queue.Queue()
 
-    # self._time_sync = message_filters.ApproximateTimeSynchronizer(
-    #   list(self._subs.values()), queue_size = 10, slop = 0.01,
-    #   allow_headerless = False)
-    # self._time_sync.registerCallback(self._buffer_frame_msgs)
-    self._subs["pose"].registerCallback(self._buffer_frame_msgs)
-    self._subs["rgb"].registerCallback(self._buffer_frame_msgs)
-    self._subs["depth"].registerCallback(self._buffer_frame_msgs)
-    self._subs["semseg"].registerCallback(self._buffer_frame_msgs)
-    self._subs["semantic_labels"].registerCallback(self._buffer_frame_msgs)
+    self._time_sync = message_filters.ApproximateTimeSynchronizer(
+      list(self._subs.values()), queue_size = 10, slop = 0.01,
+      allow_headerless = False)
+    self._time_sync.registerCallback(self._buffer_frame_msgs)
 
     self._ros_executor = SingleThreadedExecutor()
     self._ros_executor.add_node(self._rosnode)
@@ -230,9 +225,8 @@ class Ros2Subscriber(PosedRgbdDataset):
     self._intrinsics_loaded_cond.release()
 
   def _buffer_frame_msgs(self, *msgs):
-    print(msgs)
-    # if self.frame_skip <= 0 or self.f % (self.frame_skip+1) == 0:
-    #   self._frame_msgs_queue.put(msgs)
+    if self.frame_skip <= 0 or self.f % (self.frame_skip+1) == 0:
+      self._frame_msgs_queue.put(msgs)
     self.f += 1
 
   def __iter__(self):
