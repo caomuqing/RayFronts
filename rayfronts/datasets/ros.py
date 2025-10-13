@@ -43,11 +43,8 @@ try:
   from nav_msgs.msg import Odometry
   from geometry_msgs.msg import PoseStamped
   from stereo_msgs.msg import DisparityImage
-<<<<<<< HEAD
   from std_msgs.msg import String
-=======
   from nav_msgs.msg import Odometry
->>>>>>> 647f8e9bb41aaa2bfa161d4dae75cddd3fb32bdf
   from rayfronts.ros_utils import image_to_numpy, pose_to_numpy
 except ModuleNotFoundError:
   logger.warning("ROS2 modules not found !")
@@ -73,11 +70,7 @@ class Ros2Subscriber(PosedRgbdDataset):
                rgb_resolution=None,
                depth_resolution=None,
                disparity_topic = None,
-<<<<<<< HEAD
-               depth_topic=None,
-=======
                depth_topic = None,
->>>>>>> 647f8e9bb41aaa2bfa161d4dae75cddd3fb32bdf
                confidence_topic = None,
                point_cloud_topic = None,
                intrinsics_topic = None,
@@ -102,12 +95,8 @@ class Ros2Subscriber(PosedRgbdDataset):
       pose_topic: Topic containing poses of type geometry_msgs/msg/PoseStamped
       disparity_topic: Topic containing disparity images of type
         stereo_msgs/DisparityImage.
-<<<<<<< HEAD
-      depth_topic: TOpic containing depth images of type sensor_msgs/msg/Image with 32FC1 encoding in metric scale.
-=======
       depth_topic: Topic containing depth images of type sensor_msgs/msg/Image
         with 32FC1 encoding in metric scale.
->>>>>>> 647f8e9bb41aaa2bfa161d4dae75cddd3fb32bdf
       confidence_topic: (Optional) Topic containing confidence in depth values.
         Message type: sensor_msgs/msg/Image.
       point_cloud_topic: Topic containing point cloud of type
@@ -157,11 +146,7 @@ class Ros2Subscriber(PosedRgbdDataset):
       rgb = Image,
       pose = Odometry,
       disp = DisparityImage,
-<<<<<<< HEAD
-      depth= Image,
-=======
       depth = Image,
->>>>>>> 647f8e9bb41aaa2bfa161d4dae75cddd3fb32bdf
       pc = PointCloud,
       conf = Image,
     )
@@ -294,11 +279,7 @@ class Ros2Subscriber(PosedRgbdDataset):
       rdf_pose_4x4 = g3d.transform_pose_4x4(
         src_pose_4x4, self.src2rdf_transform)
 
-<<<<<<< HEAD
-      if "depth" in msgs.keys():
-=======
       if 'depth' in msgs.keys():
->>>>>>> 647f8e9bb41aaa2bfa161d4dae75cddd3fb32bdf
         depth_img = image_to_numpy(msgs["depth"])
         depth_img = torch.tensor(depth_img, dtype=torch.float).unsqueeze(0)
       elif "disp" in msgs.keys():
