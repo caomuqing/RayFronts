@@ -102,6 +102,15 @@ class SemSegEval:
     logger.info(self.dataset._cat_index_to_cat_name)
     self.num_classes = len(self.dataset._cat_index_to_cat_id)
 
+    # Cache commonly used class indices
+    self.soil_class_index = None
+    for idx, name in enumerate(self.dataset._cat_index_to_cat_name):
+      if name is None:
+        continue
+      if name.strip().lower() == "soil pile":
+        self.soil_class_index = idx
+        break
+
     # Init the visualizer
     intrinsics_3x3 = self.dataset.intrinsics_3x3
 
@@ -405,9 +414,18 @@ class SemSegEval:
     m = self.compute_semseg_metrics(
       semseg_gt_label, semseg_pred_label, semseg_gt_xyz, semseg_pred_xyz)
 
-    if vis and self.vis is not None:
-      self.vis.log_label_pc(semseg_pred_xyz, semseg_pred_label,
-                            layer="predictions/voxels")
+    # Overall predictions
+    self.vis.log_label_pc(semseg_pred_xyz, semseg_pred_label,
+                          layer="predictions/voxels")
+
+    # Soil-only visualization (if available)
+    if (self.soil_class_index is not None and
+        self.vis is not None):
+      soil_mask = semseg_pred_label == self.soil_class_index
+      if torch.any(soil_mask):
+        self.vis.log_label_pc(semseg_pred_xyz[soil_mask],
+                              semseg_pred_label[soil_mask],
+                              layer="predictions/soil")
     return m
 
   def log_metrics(self, i, m: dict[str, Union[float, torch.Tensor]], 
@@ -628,6 +646,12 @@ class SemSegEval:
         self.cfg.mapping, encoder=self.encoder,
         intrinsics_3x3=self.dataset.intrinsics_3x3, visualizer=self.vis,
         feat_compressor=self.feat_compressor)
+      self.dataset = hydra.utils.instantiate(self.cfg.dataset)
+
+      self.dataloader = torch.utils.data.DataLoader(
+        self.dataset, batch_size=self.cfg.batch_size)
+      self.dataset._cat_index_to_cat_name = \
+        [self.dataset.cat_id_to_name[i] for i in range(self.dataset.num_classes)]
       for feats_xyz, feats_feats in self.mapping_loop(mapper):
         if (i != 0 and self.cfg.online_eval_period > 0 and
             i % self.cfg.online_eval_period == 0):

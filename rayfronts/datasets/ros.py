@@ -760,8 +760,21 @@ class Ros2SemSegSubscriber(PosedRgbdDataset):
         else:
           logger.warning(f"Unknown semantic label format for ID {class_id}: {value}")
           continue
+
+        # Remap UNLABELLED (id 1) to wall
+        if class_id == 1:
+          class_name = "wall"
+        # Rename soil class for clarity
+        if class_name.lower() == "soil":
+          class_name = "soil pile"
           
-        self._cat_id_to_name[class_id] = class_name
+        if class_id not in self._cat_id_to_name:
+            self._cat_id_to_name[class_id] = class_name
+            # updated = True
+        elif self._cat_id_to_name[class_id] != class_name:
+            logger.debug(
+                "Semantic label for id %d already exists as '%s'. Incoming '%s' ignored.",
+                class_id, self._cat_id_to_name[class_id], class_name)
       
       # logger.info(f"Loaded {len(self._cat_id_to_name)} semantic classes: {self._cat_id_to_name}")
       

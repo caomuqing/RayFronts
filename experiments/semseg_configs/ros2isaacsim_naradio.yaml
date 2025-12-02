@@ -23,7 +23,10 @@ classes_to_eval: []
 # Dataset configuration
 # Note: scene_name is not needed for ROS2SemSegSubscriber
 dataset:
-  scene_name: "isaac_sim_robot3"
+  scene_name: "isaac_sim_robot5"
+  rgb_resolution: [480, 640]
+  depth_resolution: [480, 640]
+  frame_skip: 1
 
 # Mapping configuration
 mapping:
