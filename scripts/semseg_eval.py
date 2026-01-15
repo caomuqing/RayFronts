@@ -23,6 +23,7 @@ import rerun as rr
 import hydra
 from hydra.core.config_store import ConfigStore
 from omegaconf import OmegaConf
+import numpy as np
 
 import eval_utils
 
@@ -415,17 +416,22 @@ class SemSegEval:
       semseg_gt_label, semseg_pred_label, semseg_gt_xyz, semseg_pred_xyz)
 
     # Overall predictions
-    self.vis.log_label_pc(semseg_pred_xyz, semseg_pred_label,
-                          layer="predictions/voxels")
+    if self.vis is not None:
+      self.vis.log_label_pc(semseg_pred_xyz, semseg_pred_label,
+                            layer="predictions/voxels")
 
-    # Soil-only visualization (if available)
-    if (self.soil_class_index is not None and
-        self.vis is not None):
-      soil_mask = semseg_pred_label == self.soil_class_index
-      if torch.any(soil_mask):
-        self.vis.log_label_pc(semseg_pred_xyz[soil_mask],
-                              semseg_pred_label[soil_mask],
-                              layer="predictions/soil")
+      # Soil-only visualization (if available)
+      if self.soil_class_index is not None:
+        soil_mask = semseg_pred_label == self.soil_class_index
+        if torch.any(soil_mask):
+          self.vis.log_label_pc(semseg_pred_xyz[soil_mask],
+                                semseg_pred_label[soil_mask],
+                                layer="predictions/soil")
+    
+    # Store predictions for later PLY export
+    self.last_pred_xyz = semseg_pred_xyz
+    self.last_pred_label = semseg_pred_label
+    
     return m
 
   def log_metrics(self, i, m: dict[str, Union[float, torch.Tensor]], 
@@ -455,6 +461,53 @@ class SemSegEval:
         for met in class_wise_metrics:
           rr.log(f"metrics/{prefix}/classwise/{i+1}_{cls}/{met}",
                 rr.Scalar(m[met][i].item()))
+
+  def save_soil_voxels_ply(self, pred_xyz: torch.FloatTensor,
+                          pred_label: torch.LongTensor,
+                          output_path: str):
+    """Save soil-class prediction voxels as a PLY point cloud file.
+    
+    Args:
+      pred_xyz: Nx3 float tensor of voxel positions
+      pred_label: N long tensor of predicted class labels
+      output_path: Path to save the PLY file
+    """
+    if self.soil_class_index is None:
+      logger.warning("Soil class index not found, skipping PLY export")
+      return
+    
+    # Filter for soil voxels
+    soil_mask = pred_label == self.soil_class_index
+    if not torch.any(soil_mask):
+      logger.warning("No soil voxels found in predictions, skipping PLY export")
+      return
+    
+    soil_xyz = pred_xyz[soil_mask].cpu().numpy()
+    num_points = soil_xyz.shape[0]
+    
+    logger.info(f"Saving {num_points} soil voxels to {output_path}")
+    
+    # Write PLY file
+    with open(output_path, 'w') as f:
+      # PLY header
+      f.write("ply\n")
+      f.write("format ascii 1.0\n")
+      f.write(f"element vertex {num_points}\n")
+      f.write("property float x\n")
+      f.write("property float y\n")
+      f.write("property float z\n")
+      f.write("property uchar red\n")
+      f.write("property uchar green\n")
+      f.write("property uchar blue\n")
+      f.write("end_header\n")
+      
+      # Write vertices with brown color for soil
+      soil_color = [139, 69, 19]  # Brown color (RGB)
+      for i in range(num_points):
+        x, y, z = soil_xyz[i]
+        f.write(f"{x:.6f} {y:.6f} {z:.6f} {soil_color[0]} {soil_color[1]} {soil_color[2]}\n")
+    
+    logger.info(f"Successfully saved soil voxels to {output_path}")
 
   def save_metrics(self,
                    m: OrderedDict[dict[str, Union[float, torch.Tensor]]],
@@ -680,6 +733,11 @@ class SemSegEval:
 
     # 5. Save the results
     self.save_metrics(results_dict)
+
+    # 6. Save soil voxels as PLY file
+    if self.store_output and hasattr(self, 'last_pred_xyz') and hasattr(self, 'last_pred_label'):
+      soil_ply_path = os.path.join(self.cache_scene_dir, "soil_predictions.ply")
+      self.save_soil_voxels_ply(self.last_pred_xyz, self.last_pred_label, soil_ply_path)
 
     OmegaConf.save(self.cfg, self.cache_cfg_fn)
 
