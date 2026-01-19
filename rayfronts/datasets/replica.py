@@ -22,9 +22,12 @@ import PIL
 
 from rayfronts.datasets.base import PosedRgbdDataset, SemSegDataset
 
-class NiceReplicaDataset(PosedRgbdDataset):
+class NiceReplicaDataset(SemSegDataset):
   """Loads from the Replica dataset version processed by Nice-Slam.
   
+  Even though it inherits from SemSegDataset, it does not provide semseg maps,
+  just optionally provides semantic class mappings.
+
   Dataset can be found at:
   https://github.com/cvg/nice-slam/blob/master/scripts/download_replica.sh
 
@@ -132,8 +135,7 @@ class NiceReplicaDataset(PosedRgbdDataset):
         semseg_info = json.load(f)
       self._cat_id_to_name = \
         {item["id"]: item["name"] for item in semseg_info["classes"]}
-      self.cat_id_to_name = self._cat_id_to_name
-      self.num_classes = len(self._cat_id_to_name)
+      self._init_semseg_mappings(self._cat_id_to_name)
 
   @override
   def __iter__(self):
@@ -292,18 +294,8 @@ class SemanticNerfReplicaDataset(SemSegDataset):
       with open(semseg_info_f, "r", encoding="UTF-8") as f:
         semseg_info = json.load(f)
 
-      self._cat_id_to_name = \
-        {item["id"]: item["name"] for item in semseg_info["classes"]}
-
-  @property
-  @override
-  def num_classes(self):
-    return len(self._cat_id_to_name)
-
-  @property
-  @override
-  def cat_id_to_name(self):
-    return self._cat_id_to_name
+      self._init_semseg_mappings(
+        {item["id"]: item["name"] for item in semseg_info["classes"]})
 
   @override
   def __iter__(self):
@@ -337,6 +329,8 @@ class SemanticNerfReplicaDataset(SemSegDataset):
 
       if self.load_semseg:
         semseg_img = torchvision.io.read_image(self._semseg_paths[f]).long()
+        # Translate from ids to indices
+        semseg_img = self._cat_id_to_index[semseg_img]
         if (self.rgb_h != semseg_img.shape[-2] or
           self.rgb_w != semseg_img.shape[-1]):
           semseg_img = torch.nn.functional.interpolate(
