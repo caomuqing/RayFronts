@@ -224,8 +224,8 @@ class SemanticNerfReplicaDataset(SemSegDataset):
                      interp_mode=interp_mode)
     self.path = path
     self.scene_name = scene_name
-    self.original_h = 480
-    self.original_w = 640
+    self.original_h = 4096 #480
+    self.original_w = 4096 #640
     self.load_semseg = load_semseg
 
     self.rgb_h = self.original_h if self.rgb_h <= 0 else self.rgb_h
@@ -234,8 +234,8 @@ class SemanticNerfReplicaDataset(SemSegDataset):
     self.depth_w = self.original_w if self.depth_w <= 0 else self.depth_w
 
     self.intrinsics_3x3 = torch.tensor(
-      [[320, 0, self.original_w/2],
-       [0, 320, self.original_h/2],
+      [[2048, 0, self.original_w/2],
+       [0, 2048, self.original_h/2],
        [0, 0, 1]])
 
     if self.depth_h != self.original_h or self.depth_w != self.original_w:
@@ -292,8 +292,18 @@ class SemanticNerfReplicaDataset(SemSegDataset):
       with open(semseg_info_f, "r", encoding="UTF-8") as f:
         semseg_info = json.load(f)
 
-      self._init_semseg_mappings(
-        {item["id"]: item["name"] for item in semseg_info["classes"]})
+      self._cat_id_to_name = \
+        {item["id"]: item["name"] for item in semseg_info["classes"]}
+
+  @property
+  @override
+  def num_classes(self):
+    return len(self._cat_id_to_name)
+
+  @property
+  @override
+  def cat_id_to_name(self):
+    return self._cat_id_to_name
 
   @override
   def __iter__(self):
@@ -327,8 +337,6 @@ class SemanticNerfReplicaDataset(SemSegDataset):
 
       if self.load_semseg:
         semseg_img = torchvision.io.read_image(self._semseg_paths[f]).long()
-        # Translate from ids to indices
-        semseg_img = self._cat_id_to_index[semseg_img]
         if (self.rgb_h != semseg_img.shape[-2] or
           self.rgb_w != semseg_img.shape[-1]):
           semseg_img = torch.nn.functional.interpolate(

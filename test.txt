@@ -1,0 +1,8 @@
+soil
+excavator
+human
+beam
+ceiling
+pipe
+wall
+box
