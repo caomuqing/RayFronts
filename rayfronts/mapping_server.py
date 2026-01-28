@@ -28,6 +28,7 @@ import numpy as np
 import hydra
 
 from rayfronts import datasets, visualizers, image_encoders, mapping, utils
+from rayfronts.utils import compute_cos_sim
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,204 @@ class MappingServer:
       self._queries_feats = None
       self._queries_updated = False
 
+  def save_voxels_ply(self, vox_xyz: torch.FloatTensor,
+                     vox_labels: torch.LongTensor,
+                     class_name: str,
+                     output_path: str):
+    """Save voxels of a specific class as a PLY point cloud file.
+    
+    Args:
+      vox_xyz: Nx3 float tensor of voxel positions
+      vox_labels: N long tensor of class labels
+      class_name: Name of the class to save
+      output_path: Path to save the PLY file
+    """
+    # Filter for this class
+    class_mask = vox_labels == self._class_name_to_index[class_name]
+    if not torch.any(class_mask):
+      logger.debug(f"No voxels found for class '{class_name}', skipping PLY export")
+      return
+    
+    class_xyz = vox_xyz[class_mask].cpu().numpy()
+    num_points = class_xyz.shape[0]
+    
+    logger.info(f"Saving {num_points} voxels for class '{class_name}' to {output_path}")
+    
+    # Write PLY file
+    with open(output_path, 'w') as f:
+      # PLY header
+      f.write("ply\n")
+      f.write("format ascii 1.0\n")
+      f.write(f"element vertex {num_points}\n")
+      f.write("property float x\n")
+      f.write("property float y\n")
+      f.write("property float z\n")
+      f.write("property uchar red\n")
+      f.write("property uchar green\n")
+      f.write("property uchar blue\n")
+      f.write("end_header\n")
+      
+      # Write vertices with color based on class
+      # Use a simple color scheme - you can customize this
+      class_colors = {
+        "wall": [200, 200, 200],
+        "soil pile": [139, 69, 19],
+        "beam": [160, 82, 45],
+        "excavator": [255, 0, 0],
+        "background": [0, 0, 0],
+        "unlabelled": [128, 128, 128],
+      }
+      color = class_colors.get(class_name.lower(), [128, 128, 128])
+      
+      for i in range(num_points):
+        x, y, z = class_xyz[i]
+        f.write(f"{x:.6f} {y:.6f} {z:.6f} {color[0]} {color[1]} {color[2]}\n")
+    
+    logger.info(f"Successfully saved {class_name} voxels to {output_path}")
+
+  @torch.inference_mode()
+  def save_class_pointclouds(self):
+    """Save point clouds for all classes after mapping is complete."""
+    # Check if mapper has voxel data and encoder supports semantic segmentation
+    if (self.mapper.is_empty() or 
+        self.encoder is None or 
+        not hasattr(self.encoder, "encode_labels") or
+        not hasattr(self.mapper, "global_vox_xyz") or
+        not hasattr(self.mapper, "global_vox_feat")):
+      logger.info("Mapper is empty or encoder doesn't support semantic segmentation. "
+                  "Skipping class point cloud export.")
+      return
+    
+    # Ensure final accumulation
+    if hasattr(self.mapper, "accum_semantic_voxels"):
+      self.mapper.accum_semantic_voxels()
+    
+    vox_xyz = self.mapper.global_vox_xyz
+    if vox_xyz is None or vox_xyz.shape[0] == 0:
+      logger.info("No voxels in mapper. Skipping class point cloud export.")
+      return
+    
+    vox_feat = self.mapper.global_vox_feat
+    if vox_feat is None:
+      logger.info("No features in mapper. Skipping class point cloud export.")
+      return
+    
+    # Try to get class names from multiple sources
+    class_names = None
+    
+    # 1. Try dataset first
+    if hasattr(self.dataset, "cat_index_to_name") and hasattr(self.dataset, "num_classes"):
+      class_names = self.dataset.cat_index_to_name[1:]  # Skip index 0 (ignore class)
+      logger.info(f"Using classes from dataset: {class_names}")
+    
+    # 2. Try encoder config classes
+    if (class_names is None or len(class_names) == 0) and hasattr(self.cfg.encoder, "classes"):
+      encoder_classes = self.cfg.encoder.classes
+      if encoder_classes is not None and len(encoder_classes) > 0:
+        class_names = list(encoder_classes)
+        # Remove empty string if present (ignore class)
+        if len(class_names) > 0 and class_names[0] == "":
+          class_names = class_names[1:]
+        logger.info(f"Using classes from encoder config: {class_names}")
+    
+    # 3. Try encoder's own classes (for encoders like GTEncoder, SemSegWrapEncoder)
+    if (class_names is None or len(class_names) == 0) and hasattr(self.encoder, "cat_index_to_name"):
+      encoder_cat_to_name = self.encoder.cat_index_to_name
+      if encoder_cat_to_name is not None and len(encoder_cat_to_name) > 0:
+        # Get all names except index 0 (ignore class)
+        class_names = [encoder_cat_to_name[i] for i in sorted(encoder_cat_to_name.keys()) if i > 0]
+        logger.info(f"Using classes from encoder: {class_names}")
+    
+    # 4. Try queries (prompt classes)
+    if (class_names is None or len(class_names) == 0) and self._queries_labels is not None:
+      with self._query_lock:
+        # Collect all text queries
+        text_queries = []
+        if "text" in self._queries_labels:
+          text_queries.extend(self._queries_labels["text"])
+        if "img" in self._queries_labels:
+          # Skip image queries
+          pass
+        if len(text_queries) > 0:
+          class_names = text_queries
+          logger.info(f"Using classes from queries: {class_names}")
+    
+    if class_names is None or len(class_names) == 0:
+      logger.info("No classes found from dataset, encoder config, encoder, or queries. "
+                  "Skipping class point cloud export.")
+      return
+    
+    logger.info(f"Generating semantic predictions for {len(class_names)} classes...")
+    
+    # Generate text embeddings for all classes
+    text_query_mode = getattr(self.cfg.querying, "text_query_mode", "labels")
+    if text_query_mode == "labels":
+      text_embeds = self.encoder.encode_labels(class_names)
+    elif text_query_mode == "prompts":
+      text_embeds = self.encoder.encode_prompts(class_names)
+    else:
+      logger.warning(f"Unknown text_query_mode '{text_query_mode}'. Using 'labels'.")
+      text_embeds = self.encoder.encode_labels(class_names)
+    
+    # Decompress features if needed
+    compressed = getattr(self.cfg.querying, "compressed", False)
+    if (self.feat_compressor is not None and compressed):
+      vox_feat = self.feat_compressor.decompress(vox_feat)
+    
+    # Align features with language
+    vox_feat_lang = self.encoder.align_spatial_features_with_language(
+      vox_feat.unsqueeze(-1).unsqueeze(-1)).squeeze(-1).squeeze(-1)
+    
+    # Compute predictions using the same logic as eval_utils.compute_semseg_preds
+    # Note: compute_cos_sim(text_embeds, vox_feat) returns (num_voxels, num_classes)
+    chunk_size = 10000
+    prompt_denoising_thresh = 0.5
+    prediction_thresh = 0.1
+    num_chunks = int(np.ceil(vox_feat_lang.shape[0] / chunk_size))
+    preds = list()
+    for c in range(num_chunks):
+      sim_vx = compute_cos_sim(
+        text_embeds, vox_feat_lang[c*chunk_size: (c+1)*chunk_size], softmax=True)
+      
+      # Prompt denoising: find classes with low max similarity across all voxels
+      # sim_vx is (num_voxels_in_chunk, num_classes)
+      max_sim = torch.max(sim_vx, dim=0).values  # (num_classes,)
+      low_conf_classes = torch.argwhere(max_sim < prompt_denoising_thresh)
+      if low_conf_classes.shape[0] > 0:
+        # low_conf_classes is (N, 1), squeeze to (N,) for indexing
+        low_conf_indices = low_conf_classes.squeeze(-1)
+        sim_vx[:, low_conf_indices] = -torch.inf
+      
+      # Find best class for each voxel
+      sim_value, pred = torch.max(sim_vx, dim=-1)  # pred is (num_voxels_in_chunk,)
+      # 0 is the ignore id / no pred, so we add 1
+      pred += 1
+      pred[sim_value < prediction_thresh] = 0
+      preds.append(pred)
+    
+    vox_labels = torch.cat(preds, dim=0)  # (num_voxels,)
+    
+    # Create mapping from class name to index
+    self._class_name_to_index = {name: idx+1 for idx, name in enumerate(class_names)}
+    
+    # Create output directory
+    output_dir = "pointclouds"
+    if hasattr(self.cfg, "output_dir") and self.cfg.output_dir is not None:
+      output_dir = self.cfg.output_dir
+    elif hasattr(self.dataset, "scene_name"):
+      scene_name = self.dataset.scene_name.replace("/", "_")
+      output_dir = os.path.join("pointclouds", scene_name)
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save PLY file for each class
+    for class_name in class_names:
+      safe_class_name = class_name.replace(" ", "_").replace("/", "_")
+      ply_path = os.path.join(output_dir, f"{safe_class_name}.ply")
+      self.save_voxels_ply(vox_xyz, vox_labels, class_name, ply_path)
+    
+    logger.info(f"Saved point clouds for all classes to {output_dir}/")
+
   def run_queries(self):
     with self._query_lock:
       if (self._queries_feats is not None and len(self._queries_feats) > 0):
@@ -342,6 +541,9 @@ class MappingServer:
                   total_wall, total_frames_processed/total_wall,
                   total_map, total_frames_processed/total_map,
                   total_map/total_wall*100)
+
+    # Save point clouds for all classes after data runs out
+    self.save_class_pointclouds()
 
     # Shutting down or transitioning to idling
     self._status_lock.acquire()
