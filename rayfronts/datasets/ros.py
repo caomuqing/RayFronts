@@ -261,9 +261,11 @@ class Ros2Subscriber(PosedRgbdDataset):
         pose_to_numpy(msgs["pose"].pose), dtype=torch.float)
       if True:
         # Static transform from base_link to camera (CameraLeft)
-        translation = np.array([0.161, 0.060, 0.712], dtype=np.float32)
+        # translation = np.array([0.161, 0.060, 0.712], dtype=np.float32)
         # rpy = [-1.745, 0.000, -1.571]  # in radians
-        rpy = [0.0, 0.1745, 0.0]  # in radians
+        # rpy = [0.0, 0.1745, 0.0]  # in radians
+        translation = np.array([0.0584, 0.05994, 0.15091], dtype=np.float32)
+        rpy = [0.0, 1.5708, 0.0]  # in radians
         rotation_matrix = R.from_euler('xyz', rpy).as_matrix()
 
         # Construct 4x4 transform matrix in numpy
@@ -862,8 +864,10 @@ class Ros2SemSegSubscriber(PosedRgbdDataset):
         pose_to_numpy(msg_dict["pose"].pose), dtype=torch.float)
       if True:
         # Static transform from base_link to camera (CameraLeft)
-        translation = np.array([0.161, 0.060, 0.712], dtype=np.float32)
-        rpy = [0.0, 0.1745, 0.0]  # in radians
+        # translation = np.array([0.161, 0.060, 0.712], dtype=np.float32)
+        # rpy = [0.0, 0.1745, 0.0]  # in radians
+        translation = np.array([0.0584, 0.05994, 0.15091], dtype=np.float32)
+        rpy = [0.0, 1.5708, 0.0]  # in radians
         rotation_matrix = R.from_euler('xyz', rpy).as_matrix()
 
         # Construct 4x4 transform matrix in numpy

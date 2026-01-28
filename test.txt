@@ -2,3 +2,7 @@ wall
 soil
 excavator
 beam
+column
+box
+human
+pipe
