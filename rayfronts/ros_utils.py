@@ -41,6 +41,7 @@ import sys
 
 import numpy as np
 import array
+import cv2
 from scipy.spatial.transform import Rotation
 
 from sensor_msgs.msg import PointCloud2, PointField, Image
@@ -120,6 +121,72 @@ def image_to_numpy(msg):
     if channels == 1:
         data = data[...,0]
     return data
+
+def compressed_image_to_numpy(msg):
+    """Decode a ROS2 CompressedImage produced by RayFronts publishers.
+
+    Supported formats:
+    - "jpeg": returns an HxWx3 uint8 BGR image.
+    - "jpeg;depth_max=<float>": returns an HxW float32 depth map.
+
+    Depth recovery is lossy: producer-side normalization maps depth to uint8 JPEG,
+    and non-finite source values are encoded as zeros.
+    """
+    if not hasattr(msg, "format") or not hasattr(msg, "data"):
+        raise TypeError("Expected a CompressedImage-like message with format and data")
+
+    if not msg.data:
+        raise ValueError("CompressedImage data is empty")
+
+    msg_format = (msg.format or "").strip()
+    if not msg_format:
+        raise ValueError("CompressedImage format is empty")
+
+    tokens = [token.strip() for token in msg_format.split(";") if token.strip()]
+    if not tokens:
+        raise ValueError(f"CompressedImage format is invalid: {msg.format!r}")
+
+    compression = tokens[0].lower()
+    if compression != "jpeg":
+        raise ValueError(f"Unsupported compressed image format: {msg.format!r}")
+
+    depth_max = None
+    for token in tokens[1:]:
+        if token.startswith("depth_max="):
+            value = token.split("=", 1)[1].strip()
+            if not value:
+                raise ValueError(f"Missing depth_max value in format: {msg.format!r}")
+            try:
+                depth_max = float(value)
+            except ValueError as exc:
+                raise ValueError(f"Invalid depth_max value in format: {msg.format!r}") from exc
+            if depth_max < 0:
+                raise ValueError(f"depth_max must be non-negative, got {depth_max}")
+            continue
+
+        # Reject malformed metadata tokens to keep decoding assumptions explicit.
+        if "=" not in token:
+            raise ValueError(f"Unrecognized format token: {token!r}")
+        key, _ = token.split("=", 1)
+        if not key.strip():
+            raise ValueError(f"Invalid format token: {token!r}")
+
+    encoded = np.frombuffer(msg.data, dtype=np.uint8)
+    if encoded.size == 0:
+        raise ValueError("CompressedImage payload has zero bytes")
+
+    if depth_max is None:
+        decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        assert decoded is not None, "Failed to decode RGB JPEG payload"
+        if decoded.ndim != 3 or decoded.shape[2] != 3:
+            raise ValueError(f"Expected decoded RGB image to have shape (H, W, 3), got {decoded.shape}")
+        return decoded
+    else:
+        decoded = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
+        assert decoded is not None, "Failed to decode depth JPEG payload"
+        if decoded.ndim != 2:
+            raise ValueError(f"Expected decoded depth image to have shape (H, W), got {decoded.shape}")
+        return decoded.astype(np.float32) * (depth_max / 255.0)
 
 def numpy_to_image(arr, encoding) -> Image:
     if not encoding in name_to_dtypes:

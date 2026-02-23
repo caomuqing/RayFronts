@@ -44,7 +44,7 @@ try:
   from stereo_msgs.msg import DisparityImage
   from sensor_msgs.msg import CompressedImage
   from nav_msgs.msg import Odometry
-  from rayfronts.ros_utils import image_to_numpy, pose_to_numpy
+  from rayfronts.ros_utils import compressed_image_to_numpy, pose_to_numpy
 except ModuleNotFoundError:
   logger.warning("ROS2 modules not found !")
 
@@ -242,7 +242,7 @@ class Ros2MacslamSubscriber(PosedRgbdDataset):
       msgs = dict(zip(self._subs.keys(), msgs))
 
       # Parse RGB
-      rgb_img = image_to_numpy(msgs["rgb"]).astype("float") / 255
+      rgb_img = compressed_image_to_numpy(msgs["rgb"]).astype("float") / 255
       rgb_img = torch.from_numpy(rgb_img)
 
       # Parse Pose
@@ -260,22 +260,23 @@ class Ros2MacslamSubscriber(PosedRgbdDataset):
         src_pose_4x4, self.src2rdf_transform)
 
       if "depth" in msgs.keys():
-        depth_img = image_to_numpy(msgs["depth"])
+        depth_img = compressed_image_to_numpy(msgs["depth"])
         depth_img = torch.tensor(depth_img, dtype=torch.float).unsqueeze(0)
       elif "disp" in msgs.keys():
         # TODO: Why is disparity negative in ros2 zedx and why is max and min
         # flipped? Not sure if this is correct ros2 zedx behaviour but will
         # correct those here for now.
-        disparity_img = -image_to_numpy(msgs["disp"].image)
-        min_disp = msgs["disp"].max_disparity
-        max_disp = msgs["disp"].min_disparity
+        raise Exception("Not supported")
+        # disparity_img = -image_to_numpy(msgs["disp"].image)
+        # min_disp = msgs["disp"].max_disparity
+        # max_disp = msgs["disp"].min_disparity
 
-        focal_length = msgs["disp"].f
-        stereo_baseline = msgs["disp"].t
-        depth_img = focal_length*stereo_baseline/disparity_img
-        depth_img[disparity_img < min_disp] = np.inf
-        depth_img[disparity_img > max_disp] = -np.inf
-        depth_img = torch.tensor(depth_img, dtype=torch.float).unsqueeze(0)
+        # focal_length = msgs["disp"].f
+        # stereo_baseline = msgs["disp"].t
+        # depth_img = focal_length*stereo_baseline/disparity_img
+        # depth_img[disparity_img < min_disp] = np.inf
+        # depth_img[disparity_img > max_disp] = -np.inf
+        # depth_img = torch.tensor(depth_img, dtype=torch.float).unsqueeze(0)
 
       elif "pc" in msgs.keys():
         # TODO: This should be more efficient than a for loop
