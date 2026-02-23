@@ -458,47 +458,56 @@ class MappingServer(Node):
   def target_object_callback(self, msg):
     targets = [t.strip().lower() for t in msg.daa.split(",") if t.strip()]
     if not targets:
-  		self._target_objects = []
-  	else:
-  		self._target_objects = targets
-  	for target in self._target_objects:
-        if target not in self._queries_labels['text']:
-            self.add_queries(target)
+      self._target_objects = []
+    else:
+      self._target_objects = targets
+    for target in self._target_objects:
+      if target not in self._queries_labels['text']:
+        self.add_queries(target)
   
   def mode_switch_trigger(self):
-  	self.waypoint_locked = False
-  	self.target_waypoint = None
-  	self.target_waypoint2 = None
+    self.waypoint_locked = False
+    self.target_waypoint = None
+    self.target_waypoint2 = None
   
   def clear_filtered_rays(self):
-  	if self.prev_filtered_marker_ids > 0:
-  		clear_marker_array = MarkerArray()
-  		for i in range(self.prev_filtered_marker_ids):
-  			clear_marker = Marker()
-  			clear_marker.header.frame_id = "map"
-  			clear_marker.header.stamp = self.get_clock().now().to_msg()
-  			clear_marker.ns = "arrows"
-  			clear_marker.id = i
-  			clear_marker.action = Marker.DELETE
-  			clear_marker_array.markers.append(clear_marker)
-  		self.filtered_rays_publisher.publish(clear_marker_aray)
+    if self.prev_filtered_marker_ids > 0:
+      clear_marker_array = MarkerArray()
+      for i in range(self.prev_filtered_marker_ids):
+        clear_marker = Marker()
+        clear_marker.header.frame_id = "map"
+        clear_marker.header.stamp = self.get_clock().now().to_msg()
+        clear_marker.ns = "arrows"
+        clear_marker.id = 1
+        clear_marker.action = Marker.DELETE
+        clear_marker_array.markers.append(clear_marker)
+      self.filtered_rays_publisher.publish(clear_marker_array)
   
-  def create_pointcloud2_msg(self, xyz):
-  	if isinstance(xyz, torch.Tensor):
-  		xyz = xyz.detach().cpu().numpy()
-  	elif isinstance(xyz, np.ndarray):
-  		xyz = xyz
-  	else:
-  		raise TypeError(f"Expected torch.Tensor or numpy.ndarray, got {type(xyz)}")
-  	header = Header()
-  	header.stamp = self.get_clock().now().to_msg()
-  	header.frame_id = 'map'
-  	field = [PointField(name='x',offset=0,datatype=PointField.FLOAT32, count=1), PointField(name='y',offset=4,datatype=PointField.FLOAT32, count=1), PointField(name='z',offset=8,datatype=PointField.FLOAT32, count=1)]
-  	points = []
-  	for i in range(xyz.shape[0]):
-  		x,y,z = xyz[i]
-  		points.append([x,y,z])
-  	return point_cloud2.create_cloud(header, fields, points)
+  def create_colored_pointcloud_msg(self, xyz_tensor, rgb_tensor):
+    xyz = xyz_tensor.cpu().numpy()
+    rgb = (rgb_tensor*255).cpu().numpy()
+    assert xyz.shape[0] == rgb.shape[0]
+
+    def pack_rgb(r,g,b):
+      rgb_int = (int(r) << 16) | (int(g) << 8) | int(b)
+      return struct.unpack('f', struct.pack('I', rgb_int))[0]
+    
+    points = []
+    for i in range(xyz.shape[0]):
+      xo,yo,zo = xyz[i]
+      x,y,z = zo,-xo,-yo
+      r,g,b = rgb[i]
+      rgb_packed= pack_rgb(r,g,b)
+      points.append([x,y,z,rgb_packed])
+    
+    fields = [PointField(name='x',offset=0,datatype=PointField.FLOAT32, count=1), 
+              PointField(name='y',offset=4,datatype=PointField.FLOAT32, count=1), 
+              PointField(name='z',offset=8,datatype=PointField.FLOAT32, count=1), 
+              PointField(name='rgb',offset=12,datatype=PointField.FLOAT32, count=1)]
+    header = Header()
+    header.stamp = self.get_clock().now().to_msg()
+    header.frame_id = 'map'
+    return point_cloud2.create_cloud(header, fields, points)
   
   def create_colored_pointcloud_msg(self, xyz_tensor, rgb_tensor):
     xyz = xyz_tensor.cpu().numpy()

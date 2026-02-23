@@ -5,7 +5,7 @@ _target_: rayfronts.image_encoders.NARadioEncoder
 
 # Choose from "radio_v2.5-x" where x can be b,l, or g. More models can be found 
 # on https://github.com/NVlabs/RADIO/
-model_version: radio_v2.5-l
+model_version: radio_v2.5-b
 
 # If text_query is not null, then lang_model cannot be null
 lang_model: siglip
