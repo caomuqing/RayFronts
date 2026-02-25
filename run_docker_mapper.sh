@@ -6,7 +6,7 @@ docker run -it \
 	--ipc host \
 	--runtime=nvidia \
 	-e NVIDIA_DRIVER_CAPABILITIES=all \
-	-e ROS_DOMAIN_ID=1 \
+	-e ROS_DOMAIN_ID=2 \
 	-v ~/RayFronts:/workspace/RayFronts \
 	-w /workspace/RayFronts \
-	seungch2/rayfronts:jetson-radio-b-v1
+	seungch2/rayfronts:jetson-savemodel
