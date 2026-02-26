@@ -30,7 +30,7 @@ class FrontierBehavior:
 
             #DBSCAN clustering for frontier-points
             frontiers_cpu = transformed_frontiers.detach().cpu().numpy()
-            clustering = DBSCAN(eps=2.7, min_samples=3).fit(frontiers_cpu)
+            clustering = DBSCAN(eps=4.0, min_samples=5).fit(frontiers_cpu)
             labels = clustering.labels_
             unique_labels = [l for l in set(labels) if l != -1]
             viewpoints = []
@@ -42,7 +42,10 @@ class FrontierBehavior:
                 centroid_torch = centroid_torch.to(transformed_frontiers.device, dtype = transformed_frontiers.dtype)
 
                 if centroid_torch[2] > 4.0:
+                    centroid_torch[2] = 6.0 #manually set height of frontier 6m
                     viewpoints.append(centroid_torch)
+            if len(viewpoints) == 0:
+                return waypoint_locked, target_waypoint, target_waypoint2
             viewpoints = torch.stack(viewpoints)
 
             cent_msg = self.create_pointcloud2_msg(viewpoints)
@@ -58,7 +61,7 @@ class FrontierBehavior:
                 candidate_vecs = viewpoints - robot_pos_torch
                 candidate_vecs = candidate_vecs / (torch.norm(candidate_vecs, dim=1, keepdim=True) + 1e-6)
                 cos_sim = torch.matmul(candidate_vecs, cur_motion_vec)
-                momentum_weight = 5.0
+                momentum_weight = 2.0
                 scores = distances + momentum_weight*(1.0-cos_sim)
             else:
                 scores = distances
@@ -67,7 +70,7 @@ class FrontierBehavior:
             num_candidates = min(top_n, viewpoints.shape[0])
             top_indices = torch.argsort(scores)[:num_candidates]
             best_idx = top_indices[torch.randint(0, num_candidates, (1,))]
-            best_cent = viewpoints[best_idx]
+            best_cent = viewpoints[best_idx].view(-1)
 
             path = Path()
             path.header.stamp = self.get_clock().now().to_msg()
@@ -78,7 +81,7 @@ class FrontierBehavior:
                 target_waypoint = best_cent_np
                 direction = target_waypoint - cur_pose_np
                 direction = direction / np.linalg.norm(target_waypoint - cur_pose_np)
-                target_waypoint2 = target_waypoint + 2.0*direction
+                target_waypoint2 = target_waypoint + 1.0*direction
                 waypoint_locked = True
 
             target_pose = PoseStamped()

@@ -106,7 +106,11 @@ class MappingServer(Node):
 
     self.prev_filtered_marker_ids = 0
 
-    self._target_objects = []
+    self._target_objects = ['red wall']
+    #for i in range(len(self._target_objects)):
+        #self.add_queries(self._target_objects[i])
+
+    self._background_objects = []
     self.create_subscription(String, '/input_prompt', self.target_object_callback, 10)
 
     intrinsics_3x3 = self.dataset.intrinsics_3x3
@@ -184,7 +188,11 @@ class MappingServer(Node):
                               k, v in cmap_queries.items()}
         else:
           queries = [l.strip() for l in f.readlines()]
+          self._background_objects = queries
         self.add_queries(queries)
+
+    for i in range(len(self._target_objects)):
+        self.add_queries(self._target_objects[i])
 
     self.messaging_service = None
     if "messaging_service" in cfg and cfg.messaging_service is not None:
@@ -348,7 +356,7 @@ class MappingServer(Node):
       map_t1 = time.time()
 
       #behavior manager selects mode
-      self.behavior_manager.mode_select(queries_labels=self._queries_labels,target_objects = self._target_objects, queries_feats = self._queries_feats, mapper=self.mapper, publisher_dict=self.publisher_dict, subscriber=self.subscriber_dict)
+      self.behavior_manager.mode_select(queries_labels=self._queries_labels,target_objects = self._target_objects, queries_feats = self._queries_feats, mapper=self.mapper, publisher_dict=self.publisher_dict, subscriber_dict=self.subscriber_dict)
 
       if self.behavior_mode != self.behavior_manager.behavior_mode:
           self.mode_switch_trigger()

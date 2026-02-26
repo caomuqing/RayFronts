@@ -3,7 +3,7 @@ defaults:
   - dataset: "niceslam_replica"
   - mapping: "semantic_voxel_map"
   - encoder: "naradio"
-  - vis: "rerun" # Set to null to disable
+  - vis: "ros" # Set to null to disable
   - messaging_service: null # Set to null to disable
   - feat_compressor: null # Set to null to disable
   - extras
@@ -19,7 +19,7 @@ batch_size: 1
 
 # Imposing a depth limit on the data such that to test limited depth scenarios
 # Set to a negative number to not use a limit
-depth_limit: -1
+depth_limit: 15
 
 # Which pytorch interpolation mode for rgb and feature interpolation 
 # (Depth and Segmentation always use nearest-exact)
@@ -51,7 +51,7 @@ querying:
   # If you want results to be independent of other queries set this to false.
   # Image queries are seperated from text queries. i.e the softmax is computed
   # separately for the text query group and the image query group.
-  compute_prob: False
+  compute_prob: True
 
   # How often should the mapping server update query results in the map.
   period: 10

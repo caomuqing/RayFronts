@@ -161,11 +161,11 @@ class Ros2MacslamSubscriber(PosedRgbdDataset):
               history=HistoryPolicy.KEEP_LAST,
               depth=1,
           ))
-        self._subs[msg_str].registerCallback(lambda x: print(type(x)))
+        #self._subs[msg_str].registerCallback(lambda x: print(type(x)))
     self._frame_msgs_queue = queue.Queue()
 
     self._time_sync = message_filters.ApproximateTimeSynchronizer(
-      list(self._subs.values()), queue_size = 10, slop = 5,
+      list(self._subs.values()), queue_size = 10, slop = 0.3,
       allow_headerless = False)
     self._time_sync.registerCallback(self._buffer_frame_msgs)
 
@@ -222,7 +222,7 @@ class Ros2MacslamSubscriber(PosedRgbdDataset):
     self._intrinsics_loaded_cond.release()
 
   def _buffer_frame_msgs(self, *msgs):
-    print("hello")
+    #print("hello")
     if self.frame_skip <= 0 or self.f % (self.frame_skip+1) == 0:
       self._frame_msgs_queue.put(msgs)
     self.f += 1
@@ -243,12 +243,12 @@ class Ros2MacslamSubscriber(PosedRgbdDataset):
 
       # Parse RGB
       rgb_img = compressed_image_to_numpy(msgs["rgb"]).astype("float") / 255
-      rgb_img = torch.from_numpy(rgb_img)
+      rgb_img = torch.from_numpy(rgb_img).permute(2,0,1).float()
 
       # Parse Pose
       src_pose_4x4 = torch.tensor(
         pose_to_numpy(msgs["pose"].pose), dtype=torch.float)
-      transform_test = True
+      transform_test = False
       if transform_test:
           pitch = 0.261799
           R_pitch = np.array([[np.cos(pitch),0,np.sin(pitch)],[0,1,0],[-np.sin(pitch),0,np.cos(pitch)]],dtype=np.float32)

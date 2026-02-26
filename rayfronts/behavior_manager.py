@@ -20,9 +20,9 @@ class BehaviorManager:
         self.frontier_behavior = FrontierBehavior(self.get_clock)
         self.behaviors = [self.ray_behavior, self.frontier_behavior]
 
-    def mode_select(self, queries_labels, target_object, queries_feats, mapper, publisher_dict, subscriber_dict):
+    def mode_select(self, queries_labels, target_objects, queries_feats, mapper, publisher_dict, subscriber_dict):
         for behavior in self.behaviors:
-            if behavior.condition_check(queries_labels, target_object, queries_feats, mapper, publisher_dict, subscriber_dict):
+            if behavior.condition_check(queries_labels, target_objects, queries_feats, mapper, publisher_dict, subscriber_dict):
                 self.behavior_mode = behavior.name
                 return
 

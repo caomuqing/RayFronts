@@ -33,7 +33,7 @@ class RayBehavior:
                 ray_lang_aligned = mapper.encoder.align_spatial_features_with_language(ray_feat.unsqueeze(-1).unsqueeze(-1))
 
                 if ray_lang_aligned.ndim == 4:
-                    ray_lang_aligned = ray_lang_aligned.sqeeze(-1).squeeze(-1)
+                    ray_lang_aligned = ray_lang_aligned.squeeze(-1).squeeze(-1)
                 if ray_lang_aligned.ndim == 2:
                     ray_lang_aligned = ray_lang_aligned
                 if ray_lang_aligned.ndim == 1:
@@ -41,7 +41,7 @@ class RayBehavior:
 
                 if queries_feats is not None:
                     ray_scores = compute_cos_sim(queries_feats['text'], ray_lang_aligned, softmax=True)
-                    threshold=0.9
+                    threshold=0.6
 
                     relevant_scores = ray_scores[:, label_indices]
                     mask = (relevant_scores > threshold).any(dim=1)
@@ -72,6 +72,19 @@ class RayBehavior:
         xy_dirs_np = xy_dirs.cpu().numpy()
         xy_dirs_np_normed = xy_dirs_np / np.linalg.norm(xy_dirs_np, axis=1, keepdims=True)
 
+        #filter rays that are behind the robot XY
+        cur_xy = cur_pose_np[:2]
+        orig_xy = orig_world[:,:2]
+        dir_xy = xy_dirs_np_normed
+
+        ray_target_xy = orig_xy.cpu().numpy() + dir_xy
+        to_ray_target = ray_target_xy - cur_xy
+
+        dot = np.einsum('ij,ij->i',dir_xy,to_ray_target)
+        valid_mask = dot > 0
+
+        xy_dirs_np_normed = xy_dirs_np_normed[valid_mask]
+
         angle_groups = []
 
         angle_threshold_cos = np.cos(np.deg2rad(45))
@@ -90,7 +103,7 @@ class RayBehavior:
             if not assigned:
                 angle_groups.append({'centroid':xy_dir, 'rays':[xy_dir], 'indices':[i]})
 
-        MIN_RAYS_PER_GROUP=2
+        MIN_RAYS_PER_GROUP=1
         angle_groups = [g for g in angle_groups if len(g['rays']) >= MIN_RAYS_PER_GROUP]
 
         group_averages = []
@@ -105,7 +118,7 @@ class RayBehavior:
 
             density = len(group['rays'])
 
-            group_averages.append((avg_origin, avg_directions, density))
+            group_averages.append((avg_origin, avg_direction, density))
 
         k=5.0
         scored_groups = sorted(group_averages, key=lambda g: np.linalg.norm(g[0].cpu().numpy() - cur_pose_np) - k*g[2])
@@ -118,7 +131,7 @@ class RayBehavior:
         else:
             best_group = scored_groups[0]
 
-        magnitude = 3.0
+        magnitude = 2.0
 
         path = Path()
         path.header.stamp = self.get_clock().now().to_msg()
@@ -140,11 +153,11 @@ class RayBehavior:
         mid_pose.pose.position.y = float(mid_pose_np[1])
         mid_pose.pose.position.z = float(mid_pose_np[2])
         mid_pose.pose.orientation.w = 1.0
-        path.poses.append(mid_pose)
+        #path.poses.append(mid_pose)
 
 
-        target_waypoint1 = origin
-        target_waypoint2 = origin + direction*magnitude
+        target_waypoint1 = origin + direction*magnitude
+        target_waypoint2 = origin + direction*magnitude*2
 
         t1_pose = PoseStamped()
         t1_pose.header.stamp = self.get_clock().now().to_msg()
@@ -218,5 +231,5 @@ class RayBehavior:
                 clear_marker.ns = 'arrows'
                 clear_marker.id = i
                 clear_marker.action = Marker.DELETE
-                clear_marker.markers.append(clear_marker)
+                clear_marker_array.markers.append(clear_marker)
             filtered_rays_publisher.publish(clear_marker_array)
