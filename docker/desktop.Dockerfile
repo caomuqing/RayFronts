@@ -73,9 +73,18 @@ RUN cmake -DCMAKE_INSTALL_PREFIX=/usr/local \
 RUN make -j4
 RUN make install
 
+RUN pip install \
+  pye57 \
+  numba  \
+  scikit-learn
+
+RUN pip uninstall -y transformers tokenizers
+RUN pip install transformers==4.53.3
+
 # Clone rayfronts and compile
 WORKDIR /workspace
+RUN mkdir rayfronts_build && cd rayfronts_build
 RUN git clone https://github.com/RayFronts/RayFronts.git
 RUN cd RayFronts && CMAKE_INSTALL_PREFIX=/usr/local ./compile.sh
 
-WORKDIR /
+WORKDIR /workspace

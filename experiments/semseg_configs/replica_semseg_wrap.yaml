@@ -34,8 +34,8 @@ hydra:
       dataset.scene_name: office0,office1,office2,office3,office4,room0,room1,room2
 
 dataset:
-  path: /workspace/Datasets/Replica_Dataset
-  scene_name: office_0
+  path: /workspace/RayFronts/Dataset
+  scene_name: env_1
   rgb_resolution: [1024, 1024]
   depth_resolution: [1024, 1024]
   frame_skip: 0

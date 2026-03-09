@@ -6,3 +6,4 @@ ceiling
 pipe
 wall
 box
+column
