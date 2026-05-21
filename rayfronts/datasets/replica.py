@@ -246,7 +246,8 @@ class SemanticNerfReplicaDataset(SemSegDataset):
 
     self._depth_scale = 1000
     if len(scene_name.split("/")) == 1:
-      seqs = sorted(os.listdir(os.path.join(path, scene_name)))
+      base = os.path.join(path, scene_name)
+      seqs = sorted(x for x in os.listdir(base) if os.path.isdir(os.path.join(base, x)))
       scene_names = [os.path.join(scene_name, x) for x in seqs]
     else:
       scene_names = [scene_name]
