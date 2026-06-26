@@ -4,18 +4,18 @@ defaults:
 _target_: rayfronts.datasets.Ros2MacslamSubscriber
 
 # Topic containing RGB images of type sensor_msgs/msg/Image
-rgb_topic: "/macslam/data/rgb_l/image"
+rgb_topic: "/robot_1/sensors/front_stereo/left/image"
 
 # Topic containing poses of type geometry_msgs/msg/PoseStamped
 pose_topic: "/macslam/odom"
 #pose_topic: "/dummy/odometry"
 
 # Topic containing disparity images of type stereo_msgs/DisparityImage.
-depth_topic: "/macslam/data/rgb_l/depth"
+depth_topic: "/robot_1/sensors/front_stereo/depth/depth_compressed"
 
 # Topic containing intrinsics information from messages
 # of type sensor_msgs/msg/CameraInfo. Will be used at initialization only.
-intrinsics_topic: "/macslam/data/rgb_l/info"
+intrinsics_topic: "/robot_1/sensors/front_stereo/left/camera_info"
 
 # Path to json file containing intrinsics with the following keys
 # fx, fy, cx, cy, w, h. This will be prioritized over the intrinsics topic.

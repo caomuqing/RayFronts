@@ -106,7 +106,7 @@ class MappingServer(Node):
 
     self.prev_filtered_marker_ids = 0
 
-    self._target_objects = ['red wall']
+    self._target_objects = ['green tent']
     #for i in range(len(self._target_objects)):
         #self.add_queries(self._target_objects[i])
 

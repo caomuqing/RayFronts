@@ -30,6 +30,8 @@ class FrontierBehavior:
 
             #DBSCAN clustering for frontier-points
             frontiers_cpu = transformed_frontiers.detach().cpu().numpy()
+            if frontiers_cpu.shape[0] == 0:
+                return waypoint_locked, target_waypoint, target_waypoint2
             clustering = DBSCAN(eps=4.0, min_samples=5).fit(frontiers_cpu)
             labels = clustering.labels_
             unique_labels = [l for l in set(labels) if l != -1]
@@ -42,7 +44,7 @@ class FrontierBehavior:
                 centroid_torch = centroid_torch.to(transformed_frontiers.device, dtype = transformed_frontiers.dtype)
 
                 if centroid_torch[2] > 4.0:
-                    centroid_torch[2] = 6.0 #manually set height of frontier 6m
+                    centroid_torch[2] = 8.0 #manually set height of frontier 6m
                     viewpoints.append(centroid_torch)
             if len(viewpoints) == 0:
                 return waypoint_locked, target_waypoint, target_waypoint2

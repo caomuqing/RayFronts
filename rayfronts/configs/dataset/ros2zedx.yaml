@@ -4,7 +4,8 @@ defaults:
 _target_: rayfronts.datasets.Ros2Subscriber
 
 # Topic containing RGB images of type sensor_msgs/msg/Image
-rgb_topic: "/robot_1/sensors/front_stereo/left/image_rect"
+#rgb_topic: "/robot_1/sensors/front_stereo/left/image_rect"
+rgb_topic: "/robot_1/sensors/front_stereo/left/image"
 
 # Topic containing poses of type geometry_msgs/msg/PoseStamped
 pose_topic: "/robot_1/odometry_conversion/odometry"

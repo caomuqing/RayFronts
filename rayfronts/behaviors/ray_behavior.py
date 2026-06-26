@@ -41,7 +41,7 @@ class RayBehavior:
 
                 if queries_feats is not None:
                     ray_scores = compute_cos_sim(queries_feats['text'], ray_lang_aligned, softmax=True)
-                    threshold=0.6
+                    threshold=0.65
 
                     relevant_scores = ray_scores[:, label_indices]
                     mask = (relevant_scores > threshold).any(dim=1)
@@ -50,6 +50,7 @@ class RayBehavior:
                     if indices.numel() > 0:
                         self.indices = indices
                         self.ray_orig_angles = ray_orig_angles
+                        print("ray behavior activated")
                         return True
 
         return False
@@ -164,7 +165,7 @@ class RayBehavior:
         t1_pose.header.frame_id = 'map'
         t1_pose.pose.position.x = float(target_waypoint1[0])
         t1_pose.pose.position.y = float(target_waypoint1[1])
-        t1_pose.pose.position.z = float(target_waypoint1[2])
+        t1_pose.pose.position.z = 8.0 #float(target_waypoint1[2])
         t1_pose.pose.orientation.w = 1.0
         path.poses.append(t1_pose)
 
@@ -173,7 +174,7 @@ class RayBehavior:
         t2_pose.header.frame_id = 'map'
         t2_pose.pose.position.x = float(target_waypoint2[0])
         t2_pose.pose.position.y = float(target_waypoint2[1])
-        t2_pose.pose.position.z = float(target_waypoint2[2])
+        t2_pose.pose.position.z = 8.0 #float(target_waypoint2[2])
         t2_pose.pose.orientation.w = 1.0
         path.poses.append(t2_pose)
 
