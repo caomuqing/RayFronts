@@ -47,6 +47,3 @@ dataset:
   rgb_resolution: [480, 640]
   depth_resolution: [480, 640]
   frame_skip: 1
-
-vis:
-  base_point_size: 0.05
