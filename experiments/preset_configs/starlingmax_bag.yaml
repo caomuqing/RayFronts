@@ -1,7 +1,7 @@
 # Preset for Datasets/starlingmax_2026_06_24_160055.
 #
-# Usage from the repository root:
-#   ros2 bag play Datasets/starlingmax_2026_06_24_160055
+# Usage from /workspace/RayFronts when the bag is mounted at /workspace/Datasets:
+#   ros2 bag play ../Datasets/starlingmax_2026_06_24_160055
 #   python -m rayfronts.mapping_server --config-dir experiments/preset_configs --config-name starlingmax_bag
 #
 # Calibration files are provided under the bag's calibration/ directory. The
@@ -16,9 +16,10 @@ defaults:
   - override vis: rerun
   - override messaging_service: ros
 
-# Relative to the directory where the command is launched. Override this on a
-# server if the data lives elsewhere, e.g. bag_dir=/data/starlingmax_bag.
-bag_dir: Datasets/starlingmax_2026_06_24_160055
+# Relative to the directory where the command is launched.
+# Docker layout: /workspace/RayFronts and /workspace/Datasets are siblings.
+# Override this if the data lives elsewhere, e.g. bag_dir=/data/starlingmax_bag.
+bag_dir: ../Datasets/starlingmax_2026_06_24_160055
 
 dataset:
   rgb_topic: "/hires_front_small_color"
