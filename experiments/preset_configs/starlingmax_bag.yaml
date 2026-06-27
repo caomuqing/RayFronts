@@ -31,6 +31,8 @@ dataset:
   point_cloud_topic: "/tof_pc"
   point_cloud_frame: "sensor"
   confidence_topic: null
+  sync_queue_size: 100
+  sync_slop: 0.35
 
   intrinsics_file: ${bag_dir}/calibration/intrinsics.txt
   extrinsics_conf_path: ${bag_dir}/calibration/extrinsics.conf
@@ -44,4 +46,4 @@ dataset:
 
   rgb_resolution: [480, 640]
   depth_resolution: [480, 640]
-  frame_skip: 3
+  frame_skip: 1

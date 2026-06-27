@@ -491,6 +491,8 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
                rgb_resolution=None,
                depth_resolution=None,
                frame_skip=0,
+               sync_queue_size=50,
+               sync_slop=0.3,
                interp_mode="bilinear"):
     """
     Args:
@@ -527,6 +529,8 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
       rgb_resolution: See base.
       depth_resolution: See base.
       frame_skip: See base.
+      sync_queue_size: Number of messages buffered for approximate time sync.
+      sync_slop: Maximum timestamp difference in seconds for sync matching.
       interp_mode: See base.
     """
     super().__init__(rgb_resolution=rgb_resolution,
@@ -559,6 +563,8 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
         "pose_msg_type must be one of: "
         f"{sorted(pose_msg_classes.keys())}")
     pose_msg_cls = pose_msg_classes[pose_msg_type]
+    sync_queue_size = int(sync_queue_size)
+    sync_slop = float(sync_slop)
 
     self._depth_max_range = float(depth_max_range)
     self._use_point_cloud = has_pc
@@ -683,7 +689,7 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     # BEST_EFFORT to match typical VOXL publishers (avoids QoS mismatch)
     _qos = QoSProfile(
       reliability=ReliabilityPolicy.BEST_EFFORT,
-      depth=10,
+      depth=sync_queue_size,
     )
     self._subs = OrderedDict(
         rgb=message_filters.Subscriber(
@@ -703,7 +709,7 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
 
     self._frame_msgs_queue = queue.Queue(maxsize=10)
     self._time_sync = message_filters.ApproximateTimeSynchronizer(
-        list(self._subs.values()), queue_size=10, slop=0.1,
+        list(self._subs.values()), queue_size=sync_queue_size, slop=sync_slop,
         allow_headerless=False)
     self._time_sync.registerCallback(self._buffer_frame_msgs)
 
@@ -716,8 +722,9 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
 
     depth_src = point_cloud_topic if has_pc else depth_topic
     logger.info(
-      "StarlingMaxSubscriber initialized (depth source: %s, pose: %s).",
-      depth_src, pose_msg_type)
+      "StarlingMaxSubscriber initialized (depth source: %s, pose: %s, "
+      "sync_slop: %.3fs, sync_queue_size: %d).",
+      depth_src, pose_msg_type, sync_slop, sync_queue_size)
 
   # ---------- ROS helpers ----------
 

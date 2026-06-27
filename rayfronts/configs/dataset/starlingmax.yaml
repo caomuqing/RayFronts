@@ -49,5 +49,9 @@ intrinsics_file: ???
 # ToF confidence map (sensor_msgs/Image)
 confidence_topic: null
 
+# Approximate synchronization for RGB, pose, and depth/point-cloud topics.
+sync_queue_size: 50
+sync_slop: 0.3
+
 # Body frame convention of the ROS pose topic
 src_coord_system: "frd"
