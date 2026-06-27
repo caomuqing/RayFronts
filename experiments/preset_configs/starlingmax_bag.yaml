@@ -1,6 +1,6 @@
 # Preset for Datasets/starlingmax_2026_06_24_160055.
 #
-# Usage:
+# Usage from the repository root:
 #   ros2 bag play Datasets/starlingmax_2026_06_24_160055
 #   python -m rayfronts.mapping_server --config-dir experiments/preset_configs --config-name starlingmax_bag
 #
@@ -16,6 +16,10 @@ defaults:
   - override vis: rerun
   - override messaging_service: ros
 
+# Relative to the directory where the command is launched. Override this on a
+# server if the data lives elsewhere, e.g. bag_dir=/data/starlingmax_bag.
+bag_dir: Datasets/starlingmax_2026_06_24_160055
+
 dataset:
   rgb_topic: "/hires_front_small_color"
   pose_topic: "/odom_px4_fused"
@@ -27,8 +31,8 @@ dataset:
   point_cloud_frame: "sensor"
   confidence_topic: null
 
-  intrinsics_file: Datasets/starlingmax_2026_06_24_160055/calibration/intrinsics.txt
-  extrinsics_conf_path: Datasets/starlingmax_2026_06_24_160055/calibration/extrinsics.conf
+  intrinsics_file: ${bag_dir}/calibration/intrinsics.txt
+  extrinsics_conf_path: ${bag_dir}/calibration/extrinsics.conf
   rgb_frame_name: "hires_front"
   depth_frame_name: "tof"
 
