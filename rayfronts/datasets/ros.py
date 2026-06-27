@@ -58,6 +58,13 @@ except ModuleNotFoundError:
 from rayfronts.datasets.base import PosedRgbdDataset
 from rayfronts import geometry3d as g3d
 
+
+def _pose_msg_to_numpy(msg):
+  """Return a 4x4 transform from PoseStamped or Odometry-like messages."""
+  pose_msg = msg.pose.pose if hasattr(msg.pose, "pose") else msg.pose
+  return pose_to_numpy(pose_msg)
+
+
 class Ros2Subscriber(PosedRgbdDataset):
   """ROS2 subscriber node to subscribe to posed RGBD topics.
   
@@ -260,7 +267,7 @@ class Ros2Subscriber(PosedRgbdDataset):
 
       # Parse Pose
       src_pose_4x4 = torch.tensor(
-        pose_to_numpy(msgs["pose"].pose), dtype=torch.float)
+        _pose_msg_to_numpy(msgs["pose"]), dtype=torch.float)
       rdf_pose_4x4 = g3d.transform_pose_4x4(
         src_pose_4x4, self.src2rdf_transform)
 
@@ -478,6 +485,7 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
                rgb_frame_name="hires_front",
                depth_frame_name="tof",
                extrinsics_coord_system="frd",
+               pose_msg_type="pose_stamped",
                confidence_topic=None,
                src_coord_system="flu",
                rgb_resolution=None,
@@ -512,6 +520,8 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
         extrinsics file (default ``"tof"``).
       extrinsics_coord_system: 3-letter body-frame convention used in the
         extrinsics file (default ``"frd"`` for VOXL / PX4).
+      pose_msg_type: ROS message type for ``pose_topic``. Supported values are
+        ``"pose_stamped"`` and ``"odometry"``.
       confidence_topic: Optional ToF confidence image topic.
       src_coord_system: Body-frame convention of the ROS pose topic.
       rgb_resolution: See base.
@@ -536,6 +546,19 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     if has_depth_img and depth_intrinsics_file is None:
       raise ValueError("depth_intrinsics_file is required when "
                        "depth_topic is set.")
+    pose_msg_type = pose_msg_type.lower()
+    pose_msg_classes = {
+      "pose_stamped": PoseStamped,
+      "posestamped": PoseStamped,
+      "pose": PoseStamped,
+      "odometry": Odometry,
+      "odom": Odometry,
+    }
+    if pose_msg_type not in pose_msg_classes:
+      raise ValueError(
+        "pose_msg_type must be one of: "
+        f"{sorted(pose_msg_classes.keys())}")
+    pose_msg_cls = pose_msg_classes[pose_msg_type]
 
     self._depth_max_range = float(depth_max_range)
     self._use_point_cloud = has_pc
@@ -666,7 +689,7 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
         rgb=message_filters.Subscriber(
           self._rosnode, Image, rgb_topic, qos_profile=_qos),
         pose=message_filters.Subscriber(
-          self._rosnode, PoseStamped, pose_topic, qos_profile=_qos),
+          self._rosnode, pose_msg_cls, pose_topic, qos_profile=_qos),
     )
     if has_depth_img:
       self._subs["depth"] = message_filters.Subscriber(
@@ -692,8 +715,9 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     self._spin_thread.start()
 
     depth_src = point_cloud_topic if has_pc else depth_topic
-    logger.info("StarlingMaxSubscriber initialized (depth source: %s).",
-                depth_src)
+    logger.info(
+      "StarlingMaxSubscriber initialized (depth source: %s, pose: %s).",
+      depth_src, pose_msg_type)
 
   # ---------- ROS helpers ----------
 
@@ -725,8 +749,8 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
       msgs = dict(zip(self._subs.keys(), msgs))
 
       # ---- Body pose → RDF, then derive camera poses ----
-      ros_pose = msgs["pose"].pose
-      body_4x4 = torch.tensor(pose_to_numpy(ros_pose), dtype=torch.float)
+      body_4x4 = torch.tensor(
+        _pose_msg_to_numpy(msgs["pose"]), dtype=torch.float)
       body_rdf = g3d.transform_pose_4x4(body_4x4, self.src2rdf)
       pose_rgb = body_rdf @ self.T_body_rgb
       pose_depth = body_rdf @ self.T_body_depth

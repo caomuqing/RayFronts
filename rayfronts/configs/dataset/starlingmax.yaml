@@ -12,8 +12,11 @@ _target_: rayfronts.datasets.ros.StarlingMaxSubscriber
 rgb_topic: "/hires_front_small_color"
 
 # Body pose - use /vvhub_body_wrt_fixed/pose for global frame
-# or /vvhub_body_wrt_local/pose for local frame (depending on config)
+# or /vvhub_body_wrt_local/pose for local frame (depending on config).
+# Recorded ROS2 bags may instead use nav_msgs/Odometry topics such as
+# /odom_px4_fused; in that case set pose_msg_type: odometry.
 pose_topic: "/vvhub_body_wrt_fixed/pose"
+pose_msg_type: "pose_stamped"  # pose_stamped | odometry
 
 # ---- Depth source (choose ONE) ----
 # Option A: depth image + depth intrinsics
