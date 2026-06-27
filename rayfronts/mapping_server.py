@@ -61,7 +61,12 @@ class MappingServer:
       hydra.utils.instantiate(cfg.dataset)
 
     intrinsics_3x3 = self.dataset.intrinsics_3x3
-    if "vox_size" in cfg.mapping:
+    vis_base_point_size = None
+    if "vis" in cfg and cfg.vis is not None and "base_point_size" in cfg.vis:
+      vis_base_point_size = cfg.vis.base_point_size
+    if vis_base_point_size is not None:
+      base_point_size = vis_base_point_size
+    elif "vox_size" in cfg.mapping:
       base_point_size = cfg.mapping.vox_size / 2
     else:
       base_point_size = None

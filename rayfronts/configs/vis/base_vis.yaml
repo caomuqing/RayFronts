@@ -12,4 +12,8 @@ pose_period: 5
 # Whether to use the same heatmap scale across all logs.
 global_heat_scale: False
 
+# Size of rendered points/voxels in world units. Set to null to use
+# mapping.vox_size / 2.
+base_point_size: null
+
 feat_compressor: ${oc.select:feat_compressor, null}
