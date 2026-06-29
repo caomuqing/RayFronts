@@ -63,7 +63,7 @@ class SemanticPointCloud(SemanticRGBDMapping):
                encoder: image_encoders.ImageSpatialEncoder = None,
                feat_compressor: feat_compressors.FeatCompressor = None,
                interp_mode: str = "bilinear",
-               max_pts_per_frame: int = 1000):
+               max_pts_per_frame: int = -1):
     """
     Args:
       intrinsics_3x3: See base.

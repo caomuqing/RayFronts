@@ -60,7 +60,7 @@ class SemanticVoxelMap(SemanticRGBDMapping):
                encoder: image_encoders.ImageSpatialEncoder = None,
                feat_compressor: feat_compressors.FeatCompressor = None,
                interp_mode: str = "bilinear",
-               max_pts_per_frame: int = 1000,
+               max_pts_per_frame: int = -1,
                vox_size: int = 1,
                vox_accum_period: int = 1,
                windowing: bool = False):

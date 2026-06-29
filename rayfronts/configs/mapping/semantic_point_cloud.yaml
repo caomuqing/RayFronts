@@ -5,7 +5,7 @@ _target_: rayfronts.mapping.SemanticPointCloud
 
 # How many points to project per frame. Set to -1 to project all valid depth
 # points.
-max_pts_per_frame: 1000
+max_pts_per_frame: -1
 
 feat_compressor: ${oc.select:feat_compressor, null}
 

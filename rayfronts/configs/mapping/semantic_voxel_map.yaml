@@ -8,7 +8,7 @@ vox_size: 0.3
 
 # How many points to project per frame. Set to -1 to project all valid depth
 # points.
-max_pts_per_frame: 1000
+max_pts_per_frame: -1
 
 # How often do we aggregate voxels into the global representation.
 # Setting to 10, will accumulate point clouds from 10 frames before 
