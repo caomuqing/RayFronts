@@ -29,8 +29,6 @@ import torch
 import numpy as np
 
 from rayfronts.image_encoders.base import ImageSemSegEncoder
-from segment_anything import sam_model_registry, SamPredictor
-from rayfronts.image_encoders.sam_utils import sam_refinement
 
 import torch
 import torch.nn as nn
@@ -226,7 +224,19 @@ class RADSegEncoder(ImageSemSegEncoder):
 
     # Sam refinement args
     self.sam_refinement = sam_refinement
+    self._sam_refinement_fn = None
     if sam_refinement:
+      try:
+        from segment_anything import sam_model_registry, SamPredictor
+        from rayfronts.image_encoders.sam_utils import (
+          sam_refinement as sam_refinement_fn,
+        )
+      except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+          "segment_anything is required only when encoder.sam_refinement=True. "
+          "Install segment-anything or set encoder.sam_refinement=False."
+        ) from e
+      self._sam_refinement_fn = sam_refinement_fn
       self.sam_iou_thresh = sam_iou_thresh
       self.coarse_thresh = coarse_thresh
       self.minimal_area = minimal_area
@@ -334,7 +344,7 @@ class RADSegEncoder(ImageSemSegEncoder):
         self.sam_predictor.original_size = orig_img_size
         self.sam_predictor.input_size = (new_h, new_w)
         
-        refined_masks, scores, refined_logits, prompt_boxes = sam_refinement(
+        refined_masks, scores, refined_logits, prompt_boxes = self._sam_refinement_fn(
           orig_img_size, seg_pred[b], seg_probs[b], num_cls, self.sam_predictor,
           self.coarse_thresh, self.minimal_area,
           self.sam_mask_coff, self.sam_iou_thresh)
