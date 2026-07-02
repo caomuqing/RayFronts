@@ -57,5 +57,8 @@ confidence_topic: null
 sync_queue_size: 50
 sync_slop: 0.3
 
+# If > 0, prints PointCloud2 projection stats every N yielded frames.
+point_cloud_debug_log_period: 0
+
 # Body frame convention of the ROS pose topic
 src_coord_system: "frd"

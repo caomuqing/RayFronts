@@ -136,7 +136,8 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
                global_encoding: bool = False,
                zero_depth_mode: bool = False,
                infer_direction: bool = False,
-               keep_frontier_neighbor_cnts: bool = False):
+               keep_frontier_neighbor_cnts: bool = False,
+               debug_log_period: int = 0):
     """
     Args:
       intrinsics_3x3: See base.
@@ -214,6 +215,7 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
       infer_direction: Whether to infer frontier directions based on occupancy.
       keep_frontier_neighbor_cnts: Whether to store per-frontier neighborhood
         counts (empty, unobserved, occupied) in self.frontiers_neighbor_cnts.
+      debug_log_period: If > 0, print mapper point/voxel stats every N calls.
     """
     super().__init__(intrinsics_3x3, device, visualizer, clip_bbox, encoder,
                      feat_compressor, interp_mode)
@@ -255,6 +257,8 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
                      "frontier mode may not make sense !")
     self.infer_direction = infer_direction
     self.keep_frontier_neighbor_cnts = keep_frontier_neighbor_cnts
+    self.debug_log_period = int(debug_log_period)
+    self._debug_frame_idx = 0
 
     v = self.vox_size
 
@@ -415,6 +419,27 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     pc_xyz, selected_pc_ind = self._clip_pc(
       pc_xyz, selected_pc_ind.unsqueeze(-1))
     selected_pc_ind = selected_pc_ind.squeeze(-1)
+
+    if (self.debug_log_period > 0
+        and self._debug_frame_idx % self.debug_log_period == 0):
+      depth_valid = int(
+        (torch.isfinite(depth_img) & (depth_img > 0)).sum().item())
+      ray_count = int(origs.shape[0]) if origs is not None else 0
+      logger.info(
+        "Mapper debug frame=%d depth_valid=%d pc_xyz=%d vox_xyz=%d "
+        "ray_origins=%d max_pts_per_frame=%d max_empty_pts_per_frame=%d",
+        self._debug_frame_idx, depth_valid, pc_xyz.shape[0],
+        vox_xyz.shape[0], ray_count, self.max_pts_per_frame,
+        self.max_empty_pts_per_frame)
+      print(
+        "[Mapper debug] "
+        f"frame={self._debug_frame_idx} depth_valid={depth_valid} "
+        f"pc_xyz={pc_xyz.shape[0]} vox_xyz={vox_xyz.shape[0]} "
+        f"ray_origins={ray_count} "
+        f"max_pts_per_frame={self.max_pts_per_frame} "
+        f"max_empty_pts_per_frame={self.max_empty_pts_per_frame}",
+        flush=True)
+    self._debug_frame_idx += 1
 
     B, _, rH, rW = rgb_img.shape
     B, _, dH, dW = depth_img.shape

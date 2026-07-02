@@ -113,6 +113,9 @@ infer_direction: False
 # in self.frontiers_neighbor_cnts.
 keep_frontier_neighbor_cnts: False
 
+# If > 0, prints mapper point/voxel stats every N processed batches.
+debug_log_period: 0
+
 feat_compressor: ${oc.select:feat_compressor, null}
 
 interp_mode: ${interp_mode}

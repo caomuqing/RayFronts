@@ -509,6 +509,7 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
                frame_skip=0,
                sync_queue_size=50,
                sync_slop=0.3,
+               point_cloud_debug_log_period=0,
                interp_mode="bilinear"):
     """
     Args:
@@ -550,6 +551,8 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
       frame_skip: See base.
       sync_queue_size: Number of messages buffered for approximate time sync.
       sync_slop: Maximum timestamp difference in seconds for sync matching.
+      point_cloud_debug_log_period: If > 0, print point cloud projection stats
+        every N yielded frames.
       interp_mode: See base.
     """
     super().__init__(rgb_resolution=rgb_resolution,
@@ -593,8 +596,10 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
         "point_cloud_frame must be one of: 'sensor', 'body', 'world'.")
     self._point_cloud_to_world_src = _transform_from_xyz_qxyzw(
       point_cloud_to_world_transform)
+    self._point_cloud_debug_log_period = int(point_cloud_debug_log_period)
     self._shutdown_event = threading.Event()
     self.f = 0
+    self._frame_out_idx = 0
 
     # ---- Extrinsics: parse conf and build camera-to-body chains ----
     ext_entries = _parse_extrinsics_conf(extrinsics_conf_path)
@@ -813,6 +818,7 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
         dtype=torch.float).permute(2, 0, 1)
 
       # ---- Get world points from depth source ----
+      pc_debug_stats = None
       if self._use_point_cloud:
         # Point cloud path (PointCloud2): use ros_utils
         pc_arr = pointcloud2_to_array(msgs["pc"], squeeze=True)
@@ -837,6 +843,32 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
           # to the pose world frame, then convert coordinates to RDF.
           xyz_world = g3d.transform_points(
             pc_pts, self.src2rdf @ self._point_cloud_to_world_src)
+
+        if (self._point_cloud_debug_log_period > 0
+            and self._frame_out_idx % self._point_cloud_debug_log_period == 0):
+          cam_pts = g3d.transform_points(xyz_world, torch.linalg.inv(pose_rgb))
+          cam_finite = torch.isfinite(cam_pts).all(dim=-1)
+          cam_front = cam_finite & (cam_pts[:, 2] > 0)
+          in_image = 0
+          unique_pixels = 0
+          if cam_front.any():
+            uv_h = (self._rgb_intrinsics_3x3 @ cam_pts[cam_front].T).T
+            u = (uv_h[:, 0] / uv_h[:, 2]).long()
+            v = (uv_h[:, 1] / uv_h[:, 2]).long()
+            in_bounds = (
+              (u >= 0) & (u < self.rgb_w) & (v >= 0) & (v < self.rgb_h))
+            in_image = int(in_bounds.sum().item())
+            if in_image > 0:
+              unique_pixels = int(
+                torch.unique((v[in_bounds] * self.rgb_w + u[in_bounds]))
+                .numel())
+          pc_debug_stats = dict(
+            raw=int(flat.shape[0]),
+            finite=int(valid.sum()),
+            front=int(cam_front.sum().item()),
+            in_image=in_image,
+            unique_pixels=unique_pixels,
+          )
       else:
         # Depth image path: unproject to world
         depth_np = image_to_numpy(msgs["depth"])
@@ -855,6 +887,25 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
       # ---- Project world points into RGB (use RGB intrinsics; depth stays in RGB view) ----
       reg_depth = g3d.world_points_to_depth_image(
           xyz_world, pose_rgb, self._rgb_intrinsics_3x3, (self.rgb_h, self.rgb_w))
+      if pc_debug_stats is not None:
+        depth_valid = int(
+          (torch.isfinite(reg_depth) & (reg_depth > 0)).sum().item())
+        logger.info(
+          "PointCloud2 debug frame=%d frame_skip=%d raw=%d finite=%d "
+          "cam_front=%d in_image=%d unique_pixels=%d depth_valid=%d",
+          self._frame_out_idx, self.frame_skip, pc_debug_stats["raw"],
+          pc_debug_stats["finite"], pc_debug_stats["front"],
+          pc_debug_stats["in_image"], pc_debug_stats["unique_pixels"],
+          depth_valid)
+        print(
+          "[PointCloud2 debug] "
+          f"frame={self._frame_out_idx} frame_skip={self.frame_skip} "
+          f"raw={pc_debug_stats['raw']} finite={pc_debug_stats['finite']} "
+          f"cam_front={pc_debug_stats['front']} "
+          f"in_image={pc_debug_stats['in_image']} "
+          f"unique_pixels={pc_debug_stats['unique_pixels']} "
+          f"depth_valid={depth_valid}",
+          flush=True)
 
       # ---- Optional resizing ----
       if self.rgb_h > 0 and (
@@ -891,6 +942,7 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
               mode="nearest-exact").squeeze(0)
         frame_data["confidence_map"] = 1.0 - (conf / 100.0)
 
+      self._frame_out_idx += 1
       yield frame_data
 
   def shutdown(self):

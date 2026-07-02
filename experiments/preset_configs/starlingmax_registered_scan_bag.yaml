@@ -48,6 +48,10 @@ dataset:
   rgb_resolution: [480, 640]
   depth_resolution: [480, 640]
   frame_skip: 0
+  point_cloud_debug_log_period: 10
+
+mapping:
+  debug_log_period: 10
 
 querying:
   text_query_mode: labels
