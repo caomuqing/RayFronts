@@ -442,6 +442,21 @@ def _build_extrinsic_chain(transforms, child_name, root_name="body"):
   return T
 
 
+def _transform_from_xyz_qxyzw(xyz_qxyzw):
+  """Build a 4x4 transform from [x, y, z, qx, qy, qz, qw]."""
+  if xyz_qxyzw is None:
+    return torch.eye(4, dtype=torch.float)
+  if len(xyz_qxyzw) != 7:
+    raise ValueError(
+      "point_cloud_to_world_transform must be "
+      "[x, y, z, qx, qy, qz, qw].")
+  vals = [float(v) for v in xyz_qxyzw]
+  T = np.eye(4, dtype=np.float64)
+  T[:3, :3] = Rotation.from_quat(vals[3:]).as_matrix()
+  T[:3, 3] = vals[:3]
+  return torch.tensor(T, dtype=torch.float)
+
+
 class StarlingMaxSubscriber(PosedRgbdDataset):
   """ROS2 subscriber for Starling Max (VOXL 2): RGB + ToF depth.
 
@@ -456,9 +471,9 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     The depth image is unprojected to 3-D using the depth intrinsics and
     the ToF-to-world pose, then re-projected into the RGB camera.
   * **Point cloud** -- set ``point_cloud_topic`` (sensor_msgs/PointCloud2).
-    The point cloud is assumed to be in the ``src_coord_system`` world
-    frame (e.g. FLU). If it is instead in the ToF sensor frame, set
-    ``point_cloud_frame="sensor"``. Uses ``ros_utils.pointcloud2_to_array``.
+    The point cloud can be in the depth sensor frame, body frame, or a world
+    frame. For a world-frame cloud that needs a static transform into the
+    pose world frame, set ``point_cloud_to_world_transform``.
 
   Coordinate conventions
   ~~~~~~~~~~~~~~~~~~~~~~
@@ -482,6 +497,7 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
                # Depth source B: point cloud (PointCloud2 only)
                point_cloud_topic=None,
                point_cloud_frame="world",
+               point_cloud_to_world_transform=None,
                rgb_frame_name="hires_front",
                depth_frame_name="tof",
                extrinsics_coord_system="frd",
@@ -512,10 +528,13 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
       point_cloud_topic: Point cloud topic (sensor_msgs/PointCloud2).
         Mutually exclusive with ``depth_topic``.
       point_cloud_frame: Coordinate frame of the point cloud data.
-        ``"world"`` (default) means points are already in the world
-        frame matching ``src_coord_system``.  ``"sensor"`` means points
-        are in the depth sensor's local frame and will be transformed
-        to world using the depth extrinsics and body pose.
+        ``"sensor"`` means points are in the depth sensor's local frame.
+        ``"body"`` means points are in the body frame. ``"world"`` (default)
+        means points are already in a world frame using ``src_coord_system``.
+      point_cloud_to_world_transform: Optional static transform
+        ``[x, y, z, qx, qy, qz, qw]`` from the point cloud world frame to the
+        pose world frame, expressed in ``src_coord_system``. This matches the
+        numeric order accepted by ``tf2_ros static_transform_publisher``.
       rgb_frame_name: Child frame name for the RGB camera in the extrinsics
         file (default ``"hires_front"``).
       depth_frame_name: Child frame name for the depth sensor in the
@@ -568,7 +587,12 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
 
     self._depth_max_range = float(depth_max_range)
     self._use_point_cloud = has_pc
-    self._point_cloud_frame = point_cloud_frame
+    self._point_cloud_frame = str(point_cloud_frame).lower()
+    if self._point_cloud_frame not in ("sensor", "body", "world"):
+      raise ValueError(
+        "point_cloud_frame must be one of: 'sensor', 'body', 'world'.")
+    self._point_cloud_to_world_src = _transform_from_xyz_qxyzw(
+      point_cloud_to_world_transform)
     self._shutdown_event = threading.Event()
     self.f = 0
 
@@ -723,8 +747,9 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     depth_src = point_cloud_topic if has_pc else depth_topic
     logger.info(
       "StarlingMaxSubscriber initialized (depth source: %s, pose: %s, "
-      "sync_slop: %.3fs, sync_queue_size: %d).",
-      depth_src, pose_msg_type, sync_slop, sync_queue_size)
+      "point_cloud_frame: %s, sync_slop: %.3fs, sync_queue_size: %d).",
+      depth_src, pose_msg_type, self._point_cloud_frame,
+      sync_slop, sync_queue_size)
 
   # ---------- ROS helpers ----------
 
@@ -801,15 +826,17 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
         pc_pts = torch.tensor(
           np.column_stack([x[valid], y[valid], z[valid]]),
           dtype=torch.float)
-        pc_homo = g3d.pts_to_homogen(pc_pts)
         if self._point_cloud_frame == "sensor":
           # Points are in the depth sensor's local frame → world RDF
-          xyz_world = g3d.transform_points(pc_homo, pose_depth)
-        else:
+          xyz_world = g3d.transform_points(pc_pts, pose_depth)
+        elif self._point_cloud_frame == "body":
           # Points are in body frame
-          xyz_world = g3d.transform_points(pc_homo, body_rdf @ self.src2rdf)
-        # transform_points returns Nx4 when given homogeneous; we need Nx3
-        xyz_world = g3d.pts_to_nonhomo(xyz_world)
+          xyz_world = g3d.transform_points(pc_pts, body_rdf @ self.src2rdf)
+        else:
+          # Points are in a world frame. Optionally align that world frame
+          # to the pose world frame, then convert coordinates to RDF.
+          xyz_world = g3d.transform_points(
+            pc_pts, self.src2rdf @ self._point_cloud_to_world_src)
       else:
         # Depth image path: unproject to world
         depth_np = image_to_numpy(msgs["depth"])

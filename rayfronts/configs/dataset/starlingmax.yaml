@@ -27,8 +27,12 @@ depth_max_range: 3.0
 
 # Option B: point cloud (sensor_msgs/PointCloud2 only)
 point_cloud_topic: /tof_pc      # e.g. "/tof_pc"
-# "body" = points in body frame, "sensor" = in ToF local frame
+# "sensor" = in ToF local frame, "body" = body frame,
+# "world" = world/global frame.
 point_cloud_frame: "sensor"
+# Optional [x, y, z, qx, qy, qz, qw] from point-cloud world frame to pose
+# world frame. Use this for globally registered clouds in a different map frame.
+point_cloud_to_world_transform: null
 
 # ---- Extrinsics (ModalAI extrinsics.conf) ----
 # Path to the ModalAI extrinsics.conf file that defines sensor mounting.

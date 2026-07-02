@@ -1,0 +1,56 @@
+# Preset for ../Datasets/rosbag2_2026_07_01-23_52_59.
+#
+# This bag provides a dense globally registered LiDAR cloud on /registered_scan.
+# The cloud is in the LiDAR odometry world frame (superodom_map). The static
+# transform below maps it into the /odom_px4_fused pose world frame (map):
+#
+#   static_transform_publisher 0 0 0 \
+#     0.1800308 -0.1800308 0.6838047 -0.6838047 map superodom_map
+#
+# Usage from the repository root:
+#   ros2 bag play ../Datasets/rosbag2_2026_07_01-23_52_59 --loop
+#   python3 -m rayfronts.mapping_server --config-dir experiments/preset_configs --config-name starlingmax_registered_scan_bag
+
+defaults:
+  - default
+  - override dataset: starlingmax
+  - override encoder: radseg
+  - override mapping: semantic_ray_frontiers_map
+  - override vis: rerun
+  - override messaging_service: ros
+
+bag_dir: ../Datasets/rosbag2_2026_07_01-23_52_59
+calibration_dir: ../Datasets/starlingmax_2026_06_24_160055/calibration
+
+dataset:
+  rgb_topic: "/hires_front_small_color"
+  pose_topic: "/odom_px4_fused"
+  pose_msg_type: "odometry"
+
+  depth_topic: null
+  depth_intrinsics_file: null
+  point_cloud_topic: "/registered_scan"
+  point_cloud_frame: "world"
+  point_cloud_to_world_transform:
+    [0.0, 0.0, 0.0, 0.1800308, -0.1800308, 0.6838047, -0.6838047]
+  confidence_topic: null
+  sync_queue_size: 150
+  sync_slop: 0.5
+
+  intrinsics_file: ${calibration_dir}/intrinsics.txt
+  extrinsics_conf_path: ${calibration_dir}/extrinsics.conf
+  rgb_frame_name: "hires_front"
+  depth_frame_name: "tof"
+
+  src_coord_system: "frd"
+  extrinsics_coord_system: "frd"
+
+  rgb_resolution: [480, 640]
+  depth_resolution: [480, 640]
+  frame_skip: 0
+
+querying:
+  text_query_mode: labels
+  query_file: experiments/indoor_semantic_queries.json
+  compute_prob: True
+  period: 10
