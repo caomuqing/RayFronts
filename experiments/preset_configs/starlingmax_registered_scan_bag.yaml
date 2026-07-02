@@ -51,6 +51,7 @@ dataset:
   point_cloud_debug_log_period: 10
 
 mapping:
+  occ_thickness: 5
   debug_log_period: 10
 
 querying:
