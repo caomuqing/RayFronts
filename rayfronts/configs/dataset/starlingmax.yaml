@@ -34,6 +34,15 @@ point_cloud_frame: "sensor"
 # world frame. Use this for globally registered clouds in a different map frame.
 point_cloud_to_world_transform: null
 
+# Accumulate "world" scans into a denser depth image. "none" uses only the
+# latest latched scan; "radius" keeps a persistent world buffer of recent
+# points within point_cloud_accum_radius (m) of the current camera, downsampled
+# every frame at point_cloud_accum_vox (m) to stay bounded (0 disables
+# downsampling). Only applies to latched "world" clouds.
+point_cloud_accum_mode: none        # none | radius
+point_cloud_accum_radius: 8.0
+point_cloud_accum_vox: 0.1
+
 # ---- Extrinsics (ModalAI extrinsics.conf) ----
 # Path to the ModalAI extrinsics.conf file that defines sensor mounting.
 # T_body_rgb and T_body_depth are derived automatically from this file.

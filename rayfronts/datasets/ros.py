@@ -498,6 +498,9 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
                point_cloud_topic=None,
                point_cloud_frame="world",
                point_cloud_to_world_transform=None,
+               point_cloud_accum_mode="none",
+               point_cloud_accum_radius=8.0,
+               point_cloud_accum_vox=0.1,
                rgb_frame_name="hires_front",
                depth_frame_name="tof",
                extrinsics_coord_system="frd",
@@ -532,10 +535,24 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
         ``"sensor"`` means points are in the depth sensor's local frame.
         ``"body"`` means points are in the body frame. ``"world"`` (default)
         means points are already in a world frame using ``src_coord_system``.
+        A ``"world"`` cloud is treated as a globally registered map: it is NOT
+        joined to the RGB/pose time synchronizer but latched (the most recent
+        scan is cached and reused), so ``sync_slop`` governs RGB<->pose only.
+        ``"sensor"``/``"body"`` clouds are instantaneous and stay synchronized.
       point_cloud_to_world_transform: Optional static transform
         ``[x, y, z, qx, qy, qz, qw]`` from the point cloud world frame to the
         pose world frame, expressed in ``src_coord_system``. This matches the
         numeric order accepted by ``tf2_ros static_transform_publisher``.
+      point_cloud_accum_mode: How to accumulate ``"world"`` scans before
+        projecting to a depth image. ``"none"`` (default) uses only the latest
+        latched scan. ``"radius"`` keeps a persistent world buffer of recent
+        points within ``point_cloud_accum_radius`` of the current camera,
+        giving a denser depth image. Only applies to latched ``"world"`` clouds.
+      point_cloud_accum_radius: Radius in metres around the current camera
+        position to retain accumulated points (``radius`` mode).
+      point_cloud_accum_vox: Voxel size in metres used to downsample the
+        accumulated buffer each frame so it stays bounded. Set to 0 to disable
+        downsampling (not recommended in ``radius`` mode; the buffer grows).
       rgb_frame_name: Child frame name for the RGB camera in the extrinsics
         file (default ``"hires_front"``).
       depth_frame_name: Child frame name for the depth sensor in the
@@ -594,8 +611,37 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     if self._point_cloud_frame not in ("sensor", "body", "world"):
       raise ValueError(
         "point_cloud_frame must be one of: 'sensor', 'body', 'world'.")
+    # A "world" cloud is a globally registered, accumulated map, so it does not
+    # need to be time-matched with the camera. Instead of joining it to the
+    # time synchronizer (which would force a three-way timestamp coincidence
+    # and loosen the RGB<->pose window), we latch the most recent scan and use
+    # it at render time. RGB and pose are then synced on their own (tightly).
+    # "sensor"/"body" clouds are instantaneous and stay in the synchronizer.
+    self._latch_point_cloud = (self._use_point_cloud and
+                               self._point_cloud_frame == "world")
+    self._latest_pc_msg = None
+    self._pc_lock = threading.Lock()
+    # Monotonic sequence so the iterator can tell when a genuinely new scan has
+    # been cached (to merge it into the accumulation buffer only once).
+    self._pc_msg_seq = 0
+    self._pc_last_seq = -1
     self._point_cloud_to_world_src = _transform_from_xyz_qxyzw(
       point_cloud_to_world_transform)
+
+    # Radius-limited accumulation of world scans for a denser depth image.
+    accum_mode = str(point_cloud_accum_mode).lower()
+    if accum_mode not in ("none", "radius"):
+      raise ValueError("point_cloud_accum_mode must be 'none' or 'radius'.")
+    self._accum_radius = float(point_cloud_accum_radius)
+    self._accum_vox = float(point_cloud_accum_vox)
+    self._accum_world_pts = None
+    self._accum_enabled = accum_mode == "radius"
+    if self._accum_enabled and not self._latch_point_cloud:
+      logger.warning(
+        "point_cloud_accum_mode='radius' only applies to latched 'world' "
+        "clouds; disabling accumulation for point_cloud_frame='%s'.",
+        self._point_cloud_frame)
+      self._accum_enabled = False
     self._point_cloud_debug_log_period = int(point_cloud_debug_log_period)
     self._shutdown_event = threading.Event()
     self.f = 0
@@ -635,50 +681,40 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     # 4. The intrinsics stored in self.intrinsics_3x3 which refers to the
     #    intrinsics of the depth image that is registered to the RGB image.
 
-    # Pre-rectification RGB intrinsics
-    fx = int_json["fx"]
-    fy = int_json["fy"]
-    cx = int_json["cx"]
-    cy = int_json["cy"]
-    self._rgb_K_orig = np.array(
-      [[fx, 0.0, cx],
-       [0.0, fy, cy],
+    # Calibrated (pre-rectification) RGB intrinsics and the resolution they were
+    # calibrated at. The incoming stream may be a scaled version (e.g. a
+    # "*_small_color" topic), so we rescale the calibration to the actual image
+    # resolution before undistorting, rather than applying calibration-res
+    # intrinsics to a differently sized image.
+    self._rgb_K_calib = np.array(
+      [[int_json["fx"], 0.0, int_json["cx"]],
+       [0.0, int_json["fy"], int_json["cy"]],
        [0.0, 0.0, 1.0]],
       dtype=np.float32)
 
-    # Optional distortion coefficients.
+    # Optional distortion coefficients (scale-invariant, unlike K).
     dist = int_json.get("dist_coeffs", None)
     self._rgb_dist_coeffs = None
     if dist is not None:
       self._rgb_dist_coeffs = np.array(dist, dtype=np.float32).reshape(-1, 1)
 
-    orig_h = int_json.get("h", int_json.get("height", -1))
-    orig_w = int_json.get("w", int_json.get("width", -1))
+    self._calib_w = int_json.get("w", int_json.get("width", -1))
+    self._calib_h = int_json.get("h", int_json.get("height", -1))
 
-    # Compute a rectified camera matrix that crops away black borders.
-    self._rgb_newK = None # Post-rectification RGB intrinsics
-    self._rgb_undist_roi = None  # (x, y, w, h)
-    base_rgb_h, base_rgb_w = orig_h, orig_w
-    if self._rgb_dist_coeffs is not None and orig_w > 0 and orig_h > 0:
-      self._rgb_newK, self._rgb_undist_roi = cv2.getOptimalNewCameraMatrix(
-        self._rgb_K_orig, self._rgb_dist_coeffs,
-        (orig_w, orig_h),
-        alpha=0,
-        centerPrincipalPoint=True,
-      )
-      x, y, rw, rh = self._rgb_undist_roi
-      base_rgb_w, base_rgb_h = rw, rh
-      assert base_rgb_w > 0 and base_rgb_h > 0
+    # Undistortion runs on the raw image (before any resize), so the maps must
+    # be built at the raw stream resolution. Before the first frame we assume it
+    # equals the configured rgb_resolution; the first frame verifies this and
+    # rebuilds if the stream is actually a different size.
+    if self.rgb_w > 0 and self.rgb_h > 0:
+      proc_h, proc_w = self.rgb_h, self.rgb_w
+    elif self._calib_w > 0 and self._calib_h > 0:
+      proc_h, proc_w = self._calib_h, self._calib_w
+    else:
+      proc_h, proc_w = -1, -1
+    self._rgb_proc_res = (proc_h, proc_w)
+    self._rgb_rect_verified = False
 
-    K_rect = self._rgb_newK if self._rgb_newK is not None else self._rgb_K_orig
-
-    # Post-rectification RGB intrinsics
-    self._rgb_intrinsics_3x3 = torch.tensor(K_rect, dtype=torch.float)
-
-    self.rgb_h = base_rgb_h if self.rgb_h <= 0 else self.rgb_h
-    self.rgb_w = base_rgb_w if self.rgb_w <= 0 else self.rgb_w
-    self.depth_h = self.rgb_h if self.depth_h <= 0 else self.depth_h
-    self.depth_w = self.rgb_w if self.depth_w <= 0 else self.depth_w
+    self._build_rgb_rectification(proc_h, proc_w)
 
     # Depth img intrinsics in case we use depth image as depth source
     self._depth_intrinsics_3x3 = None
@@ -690,25 +726,6 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
           [0, d_json["fy"], d_json["cy"]],
           [0, 0, 1]
       ], dtype=torch.float)
-      depth_orig_h = d_json.get("h", d_json.get("height", base_rgb_h))
-      depth_orig_w = d_json.get("w", d_json.get("width", base_rgb_w))
-      if depth_orig_h <= 0:
-        depth_orig_h = base_rgb_h
-      if depth_orig_w <= 0:
-        depth_orig_w = base_rgb_w
-
-
-    if self.rgb_h != base_rgb_h or self.rgb_w != base_rgb_w:
-      self._rgb_intrinsics_3x3[0, :] *= self.rgb_w / base_rgb_w
-      self._rgb_intrinsics_3x3[1, :] *= self.rgb_h / base_rgb_h
-
-    # The intrinsics stored in self.intrinsics_3x3 which refers to the
-    # intrinsics of the depth image that is registered to the RGB image.
-    self.intrinsics_3x3 = self._rgb_intrinsics_3x3.clone()
-
-    if self.depth_h != self.rgb_h or self.depth_w != self.rgb_w:
-      self.intrinsics_3x3[0, :] *= self.depth_w / self.rgb_w
-      self.intrinsics_3x3[1, :] *= self.depth_h / self.rgb_h
 
     # ---- ROS setup ----
     if not rclpy.ok():
@@ -729,6 +746,10 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     if has_depth_img:
       self._subs["depth"] = message_filters.Subscriber(
           self._rosnode, Image, depth_topic, qos_profile=_qos)
+    elif self._latch_point_cloud:
+      # Decoupled from the synchronizer: cache the latest scan separately.
+      self._pc_sub = self._rosnode.create_subscription(
+          PointCloud2, point_cloud_topic, self._cache_point_cloud, _qos)
     else:
       self._subs["pc"] = message_filters.Subscriber(
           self._rosnode, PointCloud2, point_cloud_topic, qos_profile=_qos)
@@ -752,9 +773,69 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     depth_src = point_cloud_topic if has_pc else depth_topic
     logger.info(
       "StarlingMaxSubscriber initialized (depth source: %s, pose: %s, "
-      "point_cloud_frame: %s, sync_slop: %.3fs, sync_queue_size: %d).",
+      "point_cloud_frame: %s, latched_scan: %s, sync_slop: %.3fs, "
+      "sync_queue_size: %d). %s",
       depth_src, pose_msg_type, self._point_cloud_frame,
-      sync_slop, sync_queue_size)
+      self._latch_point_cloud, sync_slop, sync_queue_size,
+      "sync_slop now governs RGB<->pose only." if self._latch_point_cloud
+      else "")
+
+  def _build_rgb_rectification(self, proc_h, proc_w):
+    """Build undistortion maps + rectified RGB intrinsics for a raw image of
+    size (proc_h, proc_w).
+
+    The calibration is rescaled from its native resolution (``_calib_w`` x
+    ``_calib_h``) to (proc_w, proc_h) so ``cv2.undistort`` is applied at the
+    correct scale. Sets ``_rgb_K_orig`` (scaled), ``_rgb_newK``,
+    ``_rgb_undist_roi``, ``_base_rgb_{h,w}``, ``_rgb_intrinsics_3x3`` (at the
+    output RGB resolution) and ``intrinsics_3x3`` (at the depth resolution).
+    Safe to re-run on the first frame to correct a resolution assumption.
+    """
+    K = self._rgb_K_calib.copy()
+    if (self._calib_w > 0 and self._calib_h > 0 and proc_w > 0 and proc_h > 0
+        and (proc_w != self._calib_w or proc_h != self._calib_h)):
+      sx = proc_w / self._calib_w
+      sy = proc_h / self._calib_h
+      K[0, :] *= sx
+      K[1, :] *= sy
+      logger.info(
+        "Rescaled RGB calibration %dx%d -> %dx%d (sx=%.4f, sy=%.4f).",
+        self._calib_w, self._calib_h, proc_w, proc_h, sx, sy)
+    self._rgb_K_orig = K
+
+    # Rectified camera matrix that crops away black borders, at proc res.
+    self._rgb_newK = None
+    self._rgb_undist_roi = None
+    base_rgb_h, base_rgb_w = proc_h, proc_w
+    if self._rgb_dist_coeffs is not None and proc_w > 0 and proc_h > 0:
+      self._rgb_newK, self._rgb_undist_roi = cv2.getOptimalNewCameraMatrix(
+        self._rgb_K_orig, self._rgb_dist_coeffs,
+        (proc_w, proc_h),
+        alpha=0,
+        centerPrincipalPoint=True,
+      )
+      x, y, rw, rh = self._rgb_undist_roi
+      base_rgb_w, base_rgb_h = rw, rh
+      assert base_rgb_w > 0 and base_rgb_h > 0
+    self._base_rgb_h, self._base_rgb_w = base_rgb_h, base_rgb_w
+
+    K_rect = self._rgb_newK if self._rgb_newK is not None else self._rgb_K_orig
+    self._rgb_intrinsics_3x3 = torch.tensor(K_rect, dtype=torch.float)
+
+    self.rgb_h = base_rgb_h if self.rgb_h <= 0 else self.rgb_h
+    self.rgb_w = base_rgb_w if self.rgb_w <= 0 else self.rgb_w
+    self.depth_h = self.rgb_h if self.depth_h <= 0 else self.depth_h
+    self.depth_w = self.rgb_w if self.depth_w <= 0 else self.depth_w
+
+    if self.rgb_h != base_rgb_h or self.rgb_w != base_rgb_w:
+      self._rgb_intrinsics_3x3[0, :] *= self.rgb_w / base_rgb_w
+      self._rgb_intrinsics_3x3[1, :] *= self.rgb_h / base_rgb_h
+
+    # Intrinsics of the depth image that is registered to the RGB image.
+    self.intrinsics_3x3 = self._rgb_intrinsics_3x3.clone()
+    if self.depth_h != self.rgb_h or self.depth_w != self.rgb_w:
+      self.intrinsics_3x3[0, :] *= self.depth_w / self.rgb_w
+      self.intrinsics_3x3[1, :] *= self.depth_h / self.rgb_h
 
   # ---------- ROS helpers ----------
 
@@ -772,6 +853,43 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
         self._frame_msgs_queue.get()
       self._frame_msgs_queue.put(msgs)
     self.f += 1
+
+  def _cache_point_cloud(self, msg):
+    """Latch the most recent registered scan (used for 'world' clouds)."""
+    with self._pc_lock:
+      self._latest_pc_msg = msg
+      self._pc_msg_seq += 1
+
+  def _scan_to_world_points(self, pc_msg, pose_depth, body_rdf):
+    """Parse a PointCloud2 and transform its valid points into world RDF.
+
+    Returns ``(xyz_world, raw_count, finite_count)`` where ``xyz_world`` is an
+    Nx3 float tensor (or None if no finite points).
+    """
+    pc_arr = pointcloud2_to_array(pc_msg, squeeze=True)
+    flat = pc_arr.reshape(-1)
+    x = np.asarray(flat["x"], dtype=np.float64)
+    y = np.asarray(flat["y"], dtype=np.float64)
+    z = np.asarray(flat["z"], dtype=np.float64)
+    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+    raw_cnt = int(flat.shape[0])
+    finite_cnt = int(valid.sum())
+    if not np.any(valid):
+      return None, raw_cnt, finite_cnt
+    pc_pts = torch.tensor(
+      np.column_stack([x[valid], y[valid], z[valid]]), dtype=torch.float)
+    if self._point_cloud_frame == "sensor":
+      # Points are in the depth sensor's local frame → world RDF
+      xyz_world = g3d.transform_points(pc_pts, pose_depth)
+    elif self._point_cloud_frame == "body":
+      # Points are in body frame
+      xyz_world = g3d.transform_points(pc_pts, body_rdf @ self.src2rdf)
+    else:
+      # Points are in a world frame. Optionally align that world frame to the
+      # pose world frame, then convert coordinates to RDF.
+      xyz_world = g3d.transform_points(
+        pc_pts, self.src2rdf @ self._point_cloud_to_world_src)
+    return xyz_world, raw_cnt, finite_cnt
 
   # ---------- Iterator ----------
 
@@ -799,6 +917,21 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
       elif rgb_np.shape[-1] == 4:
         rgb_np = rgb_np[..., :3]
 
+      # On the first frame, ensure the undistortion maps were built for the
+      # actual stream resolution; rebuild them if the stream differs from what
+      # rgb_resolution / the calibration implied.
+      if not self._rgb_rect_verified:
+        h0, w0 = rgb_np.shape[0], rgb_np.shape[1]
+        if (w0, h0) != (self._rgb_proc_res[1], self._rgb_proc_res[0]):
+          logger.warning(
+            "RGB stream is %dx%d but rectification assumed %dx%d. Rebuilding "
+            "undistortion at the actual resolution; set rgb_resolution to "
+            "[%d, %d] so the mapper's intrinsics match the stream.",
+            w0, h0, self._rgb_proc_res[1], self._rgb_proc_res[0], h0, w0)
+          self._build_rgb_rectification(h0, w0)
+          self._rgb_proc_res = (h0, w0)
+        self._rgb_rect_verified = True
+
       # Rectify / undistort RGB using calibrated intrinsics, if available.
       if (getattr(self, "_rgb_dist_coeffs", None) is not None
           and getattr(self, "_rgb_newK", None) is not None
@@ -821,28 +954,41 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
       pc_debug_stats = None
       if self._use_point_cloud:
         # Point cloud path (PointCloud2): use ros_utils
-        pc_arr = pointcloud2_to_array(msgs["pc"], squeeze=True)
-        flat = pc_arr.reshape(-1)
-        x = np.asarray(flat["x"], dtype=np.float64)
-        y = np.asarray(flat["y"], dtype=np.float64)
-        z = np.asarray(flat["z"], dtype=np.float64)
-        valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
-        if not np.any(valid):
-          continue
-        pc_pts = torch.tensor(
-          np.column_stack([x[valid], y[valid], z[valid]]),
-          dtype=torch.float)
-        if self._point_cloud_frame == "sensor":
-          # Points are in the depth sensor's local frame → world RDF
-          xyz_world = g3d.transform_points(pc_pts, pose_depth)
-        elif self._point_cloud_frame == "body":
-          # Points are in body frame
-          xyz_world = g3d.transform_points(pc_pts, body_rdf @ self.src2rdf)
+        if self._latch_point_cloud:
+          with self._pc_lock:
+            pc_msg = self._latest_pc_msg
+            pc_seq = self._pc_msg_seq
+          if pc_msg is None:
+            # No registered scan received yet; wait for the first one.
+            continue
         else:
-          # Points are in a world frame. Optionally align that world frame
-          # to the pose world frame, then convert coordinates to RDF.
-          xyz_world = g3d.transform_points(
-            pc_pts, self.src2rdf @ self._point_cloud_to_world_src)
+          pc_msg = msgs["pc"]
+          pc_seq = None
+
+        xyz_world, raw_cnt, finite_cnt = self._scan_to_world_points(
+          pc_msg, pose_depth, body_rdf)
+        if xyz_world is None:
+          continue
+
+        if self._accum_enabled:
+          # Merge each genuinely new scan into a persistent world buffer, then
+          # keep only points within a radius of the current camera and
+          # voxel-downsample so the buffer stays bounded.
+          if pc_seq != self._pc_last_seq:
+            self._pc_last_seq = pc_seq
+            self._accum_world_pts = xyz_world if self._accum_world_pts is None \
+              else torch.cat([self._accum_world_pts, xyz_world], dim=0)
+          buf = self._accum_world_pts
+          if buf is not None and buf.shape[0] > 0:
+            cam_pos = pose_rgb[:3, 3].to(buf.device)
+            buf = buf[torch.norm(buf - cam_pos, dim=-1) <= self._accum_radius]
+            if self._accum_vox > 0 and buf.shape[0] > 0:
+              buf = g3d.pointcloud_to_sparse_voxels(
+                buf, vox_size=self._accum_vox)
+          self._accum_world_pts = buf
+          if buf is None or buf.shape[0] == 0:
+            continue
+          xyz_world = buf
 
         if (self._point_cloud_debug_log_period > 0
             and self._frame_out_idx % self._point_cloud_debug_log_period == 0):
@@ -863,8 +1009,9 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
                 torch.unique((v[in_bounds] * self.rgb_w + u[in_bounds]))
                 .numel())
           pc_debug_stats = dict(
-            raw=int(flat.shape[0]),
-            finite=int(valid.sum()),
+            raw=raw_cnt,
+            finite=finite_cnt,
+            projected=int(xyz_world.shape[0]),
             front=int(cam_front.sum().item()),
             in_image=in_image,
             unique_pixels=unique_pixels,
@@ -892,15 +1039,17 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
           (torch.isfinite(reg_depth) & (reg_depth > 0)).sum().item())
         logger.info(
           "PointCloud2 debug frame=%d frame_skip=%d raw=%d finite=%d "
-          "cam_front=%d in_image=%d unique_pixels=%d depth_valid=%d",
+          "projected=%d cam_front=%d in_image=%d unique_pixels=%d "
+          "depth_valid=%d",
           self._frame_out_idx, self.frame_skip, pc_debug_stats["raw"],
-          pc_debug_stats["finite"], pc_debug_stats["front"],
-          pc_debug_stats["in_image"], pc_debug_stats["unique_pixels"],
-          depth_valid)
+          pc_debug_stats["finite"], pc_debug_stats["projected"],
+          pc_debug_stats["front"], pc_debug_stats["in_image"],
+          pc_debug_stats["unique_pixels"], depth_valid)
         print(
           "[PointCloud2 debug] "
           f"frame={self._frame_out_idx} frame_skip={self.frame_skip} "
           f"raw={pc_debug_stats['raw']} finite={pc_debug_stats['finite']} "
+          f"projected={pc_debug_stats['projected']} "
           f"cam_front={pc_debug_stats['front']} "
           f"in_image={pc_debug_stats['in_image']} "
           f"unique_pixels={pc_debug_stats['unique_pixels']} "

@@ -3,7 +3,7 @@ defaults:
 
 _target_: rayfronts.mapping.SemanticRayFrontiersMap
 
-vox_size: 0.3
+vox_size: 0.15
 
 # How often do we aggregate voxels into the global representation.
 # Setting to 10, will accumulate point clouds from 10 frames before 
