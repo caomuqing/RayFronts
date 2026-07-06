@@ -137,6 +137,8 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
                zero_depth_mode: bool = False,
                infer_direction: bool = False,
                keep_frontier_neighbor_cnts: bool = False,
+               visibility_tolerance: float = 1.0,
+               coverage_min_unlabeled_frac: float = 0.5,
                debug_log_period: int = 0):
     """
     Args:
@@ -215,6 +217,14 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
       infer_direction: Whether to infer frontier directions based on occupancy.
       keep_frontier_neighbor_cnts: Whether to store per-frontier neighborhood
         counts (empty, unobserved, occupied) in self.frontiers_neighbor_cnts.
+      visibility_tolerance: In the decoupled pipeline
+        (process_semantic_frame), a voxel is considered visible if its camera
+        depth is within visibility_tolerance*vox_size of the closest voxel
+        projecting to the same pixel.
+      coverage_min_unlabeled_frac: A coverage-frontier cluster is flagged only
+        if the unlabeled fraction of its occupied voxels is at least this
+        value (in addition to the fronti_subsampling_min_fronti count), so
+        partially labeled surfaces are not flagged.
       debug_log_period: If > 0, print mapper point/voxel stats every N calls.
     """
     super().__init__(intrinsics_3x3, device, visualizer, clip_bbox, encoder,
@@ -257,6 +267,13 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
                      "frontier mode may not make sense !")
     self.infer_direction = infer_direction
     self.keep_frontier_neighbor_cnts = keep_frontier_neighbor_cnts
+    self.visibility_tolerance = float(visibility_tolerance)
+    self.coverage_min_unlabeled_frac = float(coverage_min_unlabeled_frac)
+    # TEMP(viz-only): height band (min, max) in metres for all voxel/frontier
+    # visualization layers. Up = -y in world RDF, relative to world origin.
+    # Set to None to visualize everything again. Does NOT affect the map,
+    # queries, or messaging — display only.
+    self.vis_height_range = None
     self.debug_log_period = int(debug_log_period)
     self._debug_frame_idx = 0
 
@@ -281,6 +298,10 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     self.frontiers = None
     # Fx3 (empty_cnt, unobserved_cnt, occupied_cnt) per frontier, or None
     self.frontiers_neighbor_cnts = None
+    # Kx3 occupied-but-unlabeled voxel clusters (decoupled pipeline);
+    # boundaries of camera semantic coverage. See
+    # update_semantic_coverage_frontiers.
+    self.semantic_coverage_frontiers = None
     # Mx(3+2) 3 for origin and 2 for angle
     self.global_rays_orig_angles = None
     # Mx(C+1) C for features, 1 for count.
@@ -357,7 +378,7 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
             (self.global_vox_xyz is None or
              self.global_vox_xyz.shape[0] == 0) and
             (self.global_rays_orig_angles is None or
-             self.global_rays_orig_angles.shapes[0]))
+             self.global_rays_orig_angles.shape[0] == 0))
 
   def summarize_frontier_feats(self):
     """Summarize the frontier rays into frontiers by averaging features.
@@ -502,41 +523,7 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
 
     if self._vox_accum_cnt >= self.vox_accum_period:
       self._vox_accum_cnt = 0
-
-      ## 1. Accumulate occupancy voxels
-      updated_vox_xyz = self.accum_occ_voxels()
-
-      ## 2. Accumulate semantic voxels
-      self.accum_semantic_voxels()
-
-      ## 3. Prune occupancy map
-      if (self.occ_pruning_period > -1 and
-          self._occ_pruning_cnt >= self.occ_pruning_period):
-
-        self._occ_pruning_cnt = 0
-        self.occ_map_vdb.prune(self.occ_pruning_tolerance)
-
-      ## 4. Prune semantic voxels
-      if (self.sem_pruning_period > -1 and
-          self.global_vox_xyz is not None and
-          self.global_vox_xyz.shape[0] > 0 and
-          self._sem_pruning_cnt >= self.sem_pruning_period):
-
-        self._sem_pruning_cnt = 0
-        self.prune_semantic_voxels(
-          torch.cat(self._tmp_vox_xyz_since_prune, dim=0))
-        self._tmp_vox_xyz_since_prune.clear()
-
-      ## 5. Update Frontiers
-
-      # Compute active window/bbox.
-      # TODO: Test if its faster to project boundary points and pose centers
-      # instead of doing min max over all tmp voxels. Or maybe let occ_pc2vdb
-      # return the bounding box since it will iterate over all voxels already.
-      if updated_vox_xyz.shape[0] > 0:
-        active_bbox_min = torch.min(updated_vox_xyz, dim = 0).values
-        active_bbox_max = torch.max(updated_vox_xyz, dim = 0).values
-        self.update_frontiers(active_bbox_min, active_bbox_max)
+      self._run_accumulation_step()
 
     if self._ray_accum_cnt >= self.ray_accum_period:
       self._ray_accum_cnt = 0
@@ -551,6 +538,254 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
         self.compute_inferred_directions()
 
     return update_info
+
+  def _run_accumulation_step(self) -> None:
+    """Accumulate tmp buffers into the global map, prune, update frontiers."""
+    ## 1. Accumulate occupancy voxels
+    updated_vox_xyz = self.accum_occ_voxels()
+
+    ## 2. Accumulate semantic voxels
+    self.accum_semantic_voxels()
+
+    ## 3. Prune occupancy map
+    if (self.occ_pruning_period > -1 and
+        self._occ_pruning_cnt >= self.occ_pruning_period):
+
+      self._occ_pruning_cnt = 0
+      self.occ_map_vdb.prune(self.occ_pruning_tolerance)
+
+    ## 4. Prune semantic voxels
+    if (self.sem_pruning_period > -1 and
+        self.global_vox_xyz is not None and
+        self.global_vox_xyz.shape[0] > 0 and
+        self._sem_pruning_cnt >= self.sem_pruning_period and
+        len(self._tmp_vox_xyz_since_prune) > 0):
+
+      self._sem_pruning_cnt = 0
+      self.prune_semantic_voxels(
+        torch.cat(self._tmp_vox_xyz_since_prune, dim=0))
+      self._tmp_vox_xyz_since_prune.clear()
+
+    ## 5. Update Frontiers
+
+    # Compute active window/bbox.
+    # TODO: Test if its faster to project boundary points and pose centers
+    # instead of doing min max over all tmp voxels. Or maybe let occ_pc2vdb
+    # return the bounding box since it will iterate over all voxels already.
+    if updated_vox_xyz is not None and updated_vox_xyz.shape[0] > 0:
+      active_bbox_min = torch.min(updated_vox_xyz, dim = 0).values
+      active_bbox_max = torch.max(updated_vox_xyz, dim = 0).values
+      self.update_frontiers(active_bbox_min, active_bbox_max)
+
+  def process_pointcloud(self,
+                         pc_xyz: torch.FloatTensor,
+                         origin_xyz: torch.FloatTensor) -> dict:
+    """Update map geometry (occupancy + frontiers) from a point cloud.
+
+    Decoupled-pipeline geometry entry point: builds occupancy directly from a
+    world-frame point cloud with free space carved from the sensor origin.
+    Semantics are attached separately via process_semantic_frame.
+
+    Args:
+      pc_xyz: Nx3 float tensor of points in world RDF coordinates.
+      origin_xyz: Float tensor of size 3; sensor origin in world RDF used as
+        the carving start point (e.g. body/LiDAR position at scan time).
+
+    Returns:
+      An update info dict (currently empty; mirrors process_posed_rgbd).
+    """
+    update_info = dict()
+    pc_xyz = pc_xyz.to(self.device)
+    origin_xyz = origin_xyz.to(self.device)
+
+    vox_xyz, vox_occ = g3d.pointcloud_to_sparse_occupancy_voxels(
+      pc_xyz, origin_xyz, self.vox_size,
+      max_num_pts=self.max_pts_per_frame,
+      max_num_empty_pts=self.max_empty_pts_per_frame,
+      occ_thickness=self.occ_thickness)
+
+    vox_xyz, vox_occ = self._clip_pc(vox_xyz, vox_occ)
+
+    # [0, 1] to [-1, occ_observ_weight]
+    vox_occ = vox_occ*self.occ_observ_weight-1
+
+    if (self.debug_log_period > 0
+        and self._debug_frame_idx % self.debug_log_period == 0):
+      logger.info(
+        "Mapper debug (pointcloud) frame=%d pc_xyz=%d vox_xyz=%d",
+        self._debug_frame_idx, pc_xyz.shape[0], vox_xyz.shape[0])
+    self._debug_frame_idx += 1
+
+    self._vox_accum_cnt += 1
+    self._occ_pruning_cnt += 1
+    self._sem_pruning_cnt += 1
+
+    if vox_xyz.shape[0] > 0:
+      self._tmp_vox_occ.append(vox_occ)
+      self._tmp_vox_xyz.append(vox_xyz)
+
+    if self._vox_accum_cnt >= self.vox_accum_period:
+      self._vox_accum_cnt = 0
+      self._run_accumulation_step()
+
+    return update_info
+
+  def _get_occupied_voxel_centers(self) -> torch.FloatTensor:
+    """Returns Nx3 occupied voxel centers from the occupancy VDB (or None).
+
+    Note: pruned/merged tiles bigger than vox_size are represented by their
+    center only (v1 approximation).
+    """
+    if self.occ_map_vdb.empty():
+      return None
+    pc_xyz_occ_size = rayfronts_cpp.occ_vdb2sizedpc(self.occ_map_vdb)
+    occupied = pc_xyz_occ_size[pc_xyz_occ_size[:, -2] > 0]
+    if occupied.shape[0] == 0:
+      return None
+    return occupied[:, :3].to(self.device)
+
+  def process_semantic_frame(self,
+                             rgb_img: torch.FloatTensor,
+                             pose_4x4: torch.FloatTensor) -> dict:
+    """Attach semantic features from an RGB keyframe to visible occupied voxels.
+
+    Decoupled-pipeline semantics entry point. Occupied voxel centers are
+    projected into the camera; a z-buffer built from the same centers filters
+    occluded voxels; the surviving voxels get the encoder features (and rgb)
+    sampled at their projected pixel, fused via the standard weighted
+    aggregation.
+
+    Args:
+      rgb_img: 1x3xHxW float tensor with values in [0, 1].
+      pose_4x4: 4x4 (or 1x4x4) float tensor; camera-to-world (RDF) pose.
+
+    Returns:
+      update info dict with "feat_img" when features were computed.
+    """
+    update_info = dict()
+    assert rgb_img.shape[0] == 1, \
+      "process_semantic_frame expects batch size 1"
+    rgb_img = rgb_img.to(self.device)
+    pose_4x4 = pose_4x4.reshape(4, 4).to(self.device)
+    _, _, rH, rW = rgb_img.shape
+
+    cand = self._get_occupied_voxel_centers()
+    if cand is None:
+      return update_info
+
+    # Project candidates into the camera.
+    cam_pts = g3d.transform_points(cand, torch.linalg.inv(pose_4x4))
+    z = cam_pts[:, 2]
+    front = (z > 0) & torch.isfinite(z)
+    if not front.any():
+      return update_info
+    uv_h = (self.intrinsics_3x3 @ cam_pts[front].T).T
+    u = (uv_h[:, 0] / uv_h[:, 2]).long()
+    v = (uv_h[:, 1] / uv_h[:, 2]).long()
+    in_bounds = (u >= 0) & (u < rW) & (v >= 0) & (v < rH)
+    if not in_bounds.any():
+      return update_info
+
+    cand_f = cand[front][in_bounds]
+    z_f = z[front][in_bounds]
+    u = u[in_bounds]
+    v = v[in_bounds]
+
+    # Visibility: z-buffer the candidates themselves with their projected
+    # voxel footprints as splats (isolated center pixels would let hidden
+    # voxels peek through the gaps); keep voxels within tolerance of the
+    # closest splat on their pixel.
+    fx = self.intrinsics_3x3[0, 0]
+    r_px = torch.ceil(0.5 * fx * self.vox_size / z_f).long()
+    zbuf = g3d.splat_min_zbuffer(u, v, z_f, r_px, (rH, rW))
+    tol = self.visibility_tolerance * self.vox_size
+    visible = z_f <= (zbuf[v, u] + tol)
+    if not visible.any():
+      return update_info
+
+    vis_vox = cand_f[visible]
+    pix_flat = (v[visible] * rW + u[visible])
+
+    # Encode features and sample at the projected pixels (same path as
+    # process_posed_rgbd).
+    feat_img = self.encoder.encode_image_to_feat_map(rgb_img)
+    feat_img = self._proj_resize_feat_map(feat_img, rH, rW)
+    update_info["feat_img"] = feat_img
+
+    feat_img_flat = feat_img.permute(0, 2, 3, 1).reshape(-1, feat_img.shape[1])
+    pts_feat = feat_img_flat[pix_flat]
+    del feat_img_flat
+    pts_rgb = rgb_img.permute(0, 2, 3, 1).reshape(-1, 3)[pix_flat]
+
+    N = vis_vox.shape[0]
+    pts_rgb_feat_cnt = torch.cat(
+      (pts_rgb, pts_feat, torch.ones((N, 1), device=self.device)), dim=-1)
+
+    self._tmp_pc_xyz.append(vis_vox)
+    self._tmp_pc_rgb_feat_cnt.append(pts_rgb_feat_cnt)
+    # Fuse immediately at keyframe rate; geometry accumulation is driven by
+    # process_pointcloud independently.
+    self.accum_semantic_voxels()
+
+    self.update_semantic_coverage_frontiers(cand)
+
+    if (self.debug_log_period > 0
+        and self._debug_frame_idx % self.debug_log_period == 0):
+      cov = self.semantic_coverage_frontiers
+      logger.info(
+        "Mapper debug (semantic frame) candidates=%d visible=%d "
+        "sem_vox=%d coverage_frontiers=%d",
+        cand.shape[0], N,
+        0 if self.global_vox_xyz is None else self.global_vox_xyz.shape[0],
+        0 if cov is None else cov.shape[0])
+
+    return update_info
+
+  def update_semantic_coverage_frontiers(
+      self, occupied_centers: torch.FloatTensor) -> None:
+    """Compute occupied-but-unlabeled voxels clustered as coverage frontiers.
+
+    These mark surfaces the camera has not yet attached semantics to
+    (geometrically known, semantically unknown).
+    """
+    if occupied_centers is None or occupied_centers.shape[0] == 0:
+      self.semantic_coverage_frontiers = None
+      return
+    if self.global_vox_xyz is None or self.global_vox_xyz.shape[0] == 0:
+      occ_cells = occupied_centers
+      unlabeled_flag = torch.ones_like(occ_cells[:, 0:1])
+    else:
+      union, flag = g3d.intersect_voxels(
+        occupied_centers, self.global_vox_xyz, self.vox_size)
+      keep = flag >= 0  # 1 = occupied only (unlabeled), 0 = occupied+labeled
+      occ_cells = union[keep]
+      unlabeled_flag = (flag[keep] == 1).float().unsqueeze(-1)
+
+    if occ_cells.shape[0] == 0 or unlabeled_flag.sum() == 0:
+      self.semantic_coverage_frontiers = None
+      return
+
+    if self.fronti_subsampling > 1:
+      # Cluster with per-cell total and unlabeled counts: flag a cell only if
+      # unlabeled voxels are numerous AND the dominant share, so partially
+      # labeled surfaces (e.g. obliquely viewed ground) are not flagged
+      # wholesale.
+      feat = torch.cat(
+        [torch.ones_like(unlabeled_flag), unlabeled_flag], dim=-1)
+      clustered, cnts = g3d.pointcloud_to_sparse_voxels(
+        occ_cells, vox_size=self.vox_size*self.fronti_subsampling,
+        feat_pc=feat, aggregation="sum")
+      total = cnts[:, 0]
+      unlabeled_cnt = cnts[:, 1]
+      mask = ((unlabeled_cnt > self.fronti_subsampling_min_fronti) &
+              (unlabeled_cnt / total.clamp(min=1) >=
+               self.coverage_min_unlabeled_frac))
+      clustered = clustered[mask]
+      self.semantic_coverage_frontiers = \
+        clustered if clustered.shape[0] > 0 else None
+    else:
+      self.semantic_coverage_frontiers = \
+        occ_cells[unlabeled_flag.squeeze(-1) == 1]
 
   def cast_semantic_rays(self) -> None:
     """Cast semantic rays accumulated in the temporary buffers onto frontiers.
@@ -911,40 +1146,61 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     return r
 
   @override
+  def _vis_height_mask(self, xyz: torch.FloatTensor):
+    """TEMP(viz-only): boolean mask for self.vis_height_range (up = -y).
+
+    Returns None when the filter is disabled (vis_height_range is None).
+    """
+    if self.vis_height_range is None:
+      return None
+    height = -xyz[:, 1]
+    return ((height >= self.vis_height_range[0]) &
+            (height <= self.vis_height_range[1]))
+
   def vis_map(self) -> None:
     if self.visualizer is None or self.is_empty():
       return
 
     # Vis semantic voxels
     if self.global_vox_xyz is not None and self.global_vox_xyz.shape[0] > 0:
-      self.visualizer.log_pc(self.global_vox_xyz, self.global_vox_rgb,
-                            layer="voxel_rgb")
-      if self.encoder is not None:
-        self.visualizer.log_feature_pc(
-          self.global_vox_xyz, self.global_vox_feat, layer="voxel_feature")
+      m = self._vis_height_mask(self.global_vox_xyz)
+      vox_xyz = self.global_vox_xyz if m is None else self.global_vox_xyz[m]
+      if vox_xyz.shape[0] > 0:
+        vox_rgb = self.global_vox_rgb if m is None else self.global_vox_rgb[m]
+        self.visualizer.log_pc(vox_xyz, vox_rgb, layer="voxel_rgb")
+        if self.encoder is not None:
+          vox_feat = self.global_vox_feat if m is None \
+            else self.global_vox_feat[m]
+          self.visualizer.log_feature_pc(
+            vox_xyz, vox_feat, layer="voxel_feature")
 
-      log_hit_count = torch.log2(self.global_vox_cnt.squeeze())
-      self.visualizer.log_heat_pc(self.global_vox_xyz, log_hit_count,
-                                  layer="voxel_log_hit_count")
+        vox_cnt = self.global_vox_cnt if m is None else self.global_vox_cnt[m]
+        log_hit_count = torch.log2(vox_cnt.squeeze(-1))
+        self.visualizer.log_heat_pc(vox_xyz, log_hit_count,
+                                    layer="voxel_log_hit_count")
 
     # Vis occupancy voxels
     if not self.occ_map_vdb.empty():
       pc_xyz_occ_size = rayfronts_cpp.occ_vdb2sizedpc(self.occ_map_vdb)
+      m = self._vis_height_mask(pc_xyz_occ_size[:, :3])
+      if m is not None:
+        pc_xyz_occ_size = pc_xyz_occ_size[m]
 
-      self.visualizer.log_occ_pc(
-        pc_xyz_occ_size[:, :3],
-        torch.clamp(pc_xyz_occ_size[:, -2:-1], min=-1, max=1),
-        layer="voxel_occ"
-      )
-
-      tiles = pc_xyz_occ_size[pc_xyz_occ_size[:, -1] > self.vox_size, :]
-      if tiles.shape[0] > 0:
+      if pc_xyz_occ_size.shape[0] > 0:
         self.visualizer.log_occ_pc(
-          tiles[:, :3],
-          torch.clamp(tiles[:, -2:-1], min=-1, max=1),
-          tiles[:, -1:],
-          layer="voxel_occ_tiles"
+          pc_xyz_occ_size[:, :3],
+          torch.clamp(pc_xyz_occ_size[:, -2:-1], min=-1, max=1),
+          layer="voxel_occ"
         )
+
+        tiles = pc_xyz_occ_size[pc_xyz_occ_size[:, -1] > self.vox_size, :]
+        if tiles.shape[0] > 0:
+          self.visualizer.log_occ_pc(
+            tiles[:, :3],
+            torch.clamp(tiles[:, -2:-1], min=-1, max=1),
+            tiles[:, -1:],
+            layer="voxel_occ_tiles"
+          )
 
     # Vis frontiers
     if self.frontiers is not None and self.frontiers.shape[0] > 0:
@@ -953,6 +1209,20 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
         fronti_rgb = self.frontiers_neighbor_cnts / \
           self.frontiers_neighbor_cnts.max(dim=0).values.clamp(min=1)
       self.visualizer.log_pc(self.frontiers, fronti_rgb, layer="frontiers")
+
+    # Vis semantic coverage frontiers (occupied but unlabeled; decoupled
+    # pipeline only). Fixed orange to distinguish from geometric frontiers.
+    if (self.semantic_coverage_frontiers is not None and
+        self.semantic_coverage_frontiers.shape[0] > 0):
+      cov = self.semantic_coverage_frontiers
+      m = self._vis_height_mask(cov)
+      if m is not None:
+        cov = cov[m]
+      if cov.shape[0] > 0:
+        cov_rgb = torch.tensor([[1.0, 0.55, 0.0]], device=cov.device).expand(
+          cov.shape[0], 3)
+        self.visualizer.log_pc(cov, cov_rgb,
+                               layer="semantic_coverage_frontiers")
 
     # Vis rays
     if (self.global_rays_orig_angles is not None and

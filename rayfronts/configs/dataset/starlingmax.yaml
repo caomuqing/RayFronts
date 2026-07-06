@@ -43,6 +43,17 @@ point_cloud_accum_mode: none        # none | radius
 point_cloud_accum_radius: 8.0
 point_cloud_accum_vox: 0.1
 
+# Decoupled geometry/semantics pipeline: yield raw world-frame scans (with a
+# scan-time origin for free-space carving) and synced RGB/pose frames as
+# separate tagged items instead of rendering a registered depth image.
+# Requires point_cloud_frame: world and the decoupled_pipeline server mode.
+decoupled_mode: false
+
+# Decoupled mode only: drop scans without a pose within this many seconds of
+# their stamp (a wrong carving origin corrupts occupancy — e.g. stale scans
+# queued during encoder warmup, or bag-loop wraps).
+origin_max_dt: 0.5
+
 # ---- Extrinsics (ModalAI extrinsics.conf) ----
 # Path to the ModalAI extrinsics.conf file that defines sensor mounting.
 # T_body_rgb and T_body_depth are derived automatically from this file.

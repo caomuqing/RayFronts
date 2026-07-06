@@ -22,7 +22,7 @@ import threading
 import queue
 from typing_extensions import override, deprecated
 from typing import Tuple, Union
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import logging
 import json
 
@@ -501,6 +501,8 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
                point_cloud_accum_mode="none",
                point_cloud_accum_radius=8.0,
                point_cloud_accum_vox=0.1,
+               decoupled_mode=False,
+               origin_max_dt=0.5,
                rgb_frame_name="hires_front",
                depth_frame_name="tof",
                extrinsics_coord_system="frd",
@@ -553,6 +555,18 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
       point_cloud_accum_vox: Voxel size in metres used to downsample the
         accumulated buffer each frame so it stays bounded. Set to 0 to disable
         downsampling (not recommended in ``radius`` mode; the buffer grows).
+      decoupled_mode: Decoupled geometry/semantics pipeline. Instead of
+        rendering the point cloud to a registered depth image per RGB frame,
+        the iterator yields tagged items: ``{"type": "scan", "pc_xyz",
+        "origin"}`` for every point cloud (world RDF points + sensor origin
+        looked up from a pose buffer at the scan stamp) and ``{"type":
+        "frame", "rgb_img", "pose_4x4"}`` for every synced RGB/pose pair.
+        Requires ``point_cloud_topic`` with ``point_cloud_frame: "world"``.
+        Use with the decoupled mapping server loop.
+      origin_max_dt: Decoupled mode only. Maximum |scan stamp - pose stamp|
+        in seconds for the carving-origin lookup; scans without a pose within
+        this window are dropped (protects against stale queued scans and
+        bag-loop wraps carving from a wrong origin).
       rgb_frame_name: Child frame name for the RGB camera in the extrinsics
         file (default ``"hires_front"``).
       depth_frame_name: Child frame name for the depth sensor in the
@@ -642,6 +656,25 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
         "clouds; disabling accumulation for point_cloud_frame='%s'.",
         self._point_cloud_frame)
       self._accum_enabled = False
+
+    # Decoupled geometry/semantics pipeline (see docstring).
+    self._decoupled_mode = bool(decoupled_mode)
+    if self._decoupled_mode and (not has_pc or
+                                 self._point_cloud_frame != "world"):
+      raise ValueError(
+        "decoupled_mode requires point_cloud_topic with "
+        "point_cloud_frame='world'.")
+    # Scans pending geometry processing (decoupled mode). Oldest dropped.
+    self._scan_queue = queue.Queue(maxsize=8)
+    # Ring buffer of recent (stamp_ns, body_pose_4x4 src-frame numpy) used to
+    # look up the sensor origin at scan time for free space carving.
+    # 2000 entries covers ~10s even at a 200Hz odometry rate.
+    self._pose_buf = deque(maxlen=2000)
+    self._pose_lock = threading.Lock()
+    # Scans with no pose within this window of their stamp are dropped
+    # (carving from a wrong origin corrupts occupancy).
+    self._origin_max_dt = float(origin_max_dt)
+    self._origin_skipped = 0
     self._point_cloud_debug_log_period = int(point_cloud_debug_log_period)
     self._shutdown_event = threading.Event()
     self.f = 0
@@ -743,6 +776,9 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
         pose=message_filters.Subscriber(
           self._rosnode, pose_msg_cls, pose_topic, qos_profile=_qos),
     )
+    if self._decoupled_mode:
+      # Side-tap every pose (not only synced ones) to look up scan origins.
+      self._subs["pose"].registerCallback(self._cache_pose)
     if has_depth_img:
       self._subs["depth"] = message_filters.Subscriber(
           self._rosnode, Image, depth_topic, qos_profile=_qos)
@@ -837,6 +873,57 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
       self.intrinsics_3x3[0, :] *= self.depth_w / self.rgb_w
       self.intrinsics_3x3[1, :] *= self.depth_h / self.rgb_h
 
+  def _parse_rectify_rgb(self, rgb_msg):
+    """Parse an Image msg into a rectified, resized, RGB CHW float tensor."""
+    rgb_np = image_to_numpy(rgb_msg)
+    if rgb_np.ndim == 2:
+      rgb_np = np.stack([rgb_np] * 3, axis=-1)
+    elif rgb_np.shape[-1] == 4:
+      rgb_np = rgb_np[..., :3]
+
+    # On the first frame, ensure the undistortion maps were built for the
+    # actual stream resolution; rebuild them if the stream differs from what
+    # rgb_resolution / the calibration implied.
+    if not self._rgb_rect_verified:
+      h0, w0 = rgb_np.shape[0], rgb_np.shape[1]
+      if (w0, h0) != (self._rgb_proc_res[1], self._rgb_proc_res[0]):
+        logger.warning(
+          "RGB stream is %dx%d but rectification assumed %dx%d. Rebuilding "
+          "undistortion at the actual resolution; set rgb_resolution to "
+          "[%d, %d] so the mapper's intrinsics match the stream.",
+          w0, h0, self._rgb_proc_res[1], self._rgb_proc_res[0], h0, w0)
+        self._build_rgb_rectification(h0, w0)
+        self._rgb_proc_res = (h0, w0)
+      self._rgb_rect_verified = True
+
+    # Rectify / undistort RGB using calibrated intrinsics, if available.
+    if (getattr(self, "_rgb_dist_coeffs", None) is not None
+        and getattr(self, "_rgb_newK", None) is not None
+        and getattr(self, "_rgb_undist_roi", None) is not None):
+      undist = cv2.undistort(
+        rgb_np, self._rgb_K_orig, self._rgb_dist_coeffs,
+        None, self._rgb_newK)
+      x, y, rw, rh = self._rgb_undist_roi
+      undist = undist[y:y+rh, x:x+rw]
+      rgb_np = undist
+
+    # Flip BGR → RGB (VOXL typically publishes bgra8 or bgr8)
+    if rgb_np.shape[-1] == 3:
+      rgb_np = rgb_np[..., ::-1].copy()
+    rgb_img = torch.tensor(
+      rgb_np.astype(np.float32) / 255.0,
+      dtype=torch.float).permute(2, 0, 1)
+
+    if self.rgb_h > 0 and (
+        rgb_img.shape[-2] != self.rgb_h
+        or rgb_img.shape[-1] != self.rgb_w):
+      rgb_img = torch.nn.functional.interpolate(
+          rgb_img.unsqueeze(0), size=(self.rgb_h, self.rgb_w),
+          mode=self.interp_mode,
+          antialias=self.interp_mode in ("bilinear", "bicubic")
+      ).squeeze(0)
+    return rgb_img
+
   # ---------- ROS helpers ----------
 
   def _spin_ros(self):
@@ -859,6 +946,60 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     with self._pc_lock:
       self._latest_pc_msg = msg
       self._pc_msg_seq += 1
+    if self._decoupled_mode:
+      if self._scan_queue.full():
+        try:
+          self._scan_queue.get_nowait()  # Drop oldest, prioritize newer.
+        except queue.Empty:
+          pass
+      self._scan_queue.put(msg)
+
+  def _cache_pose(self, msg):
+    """Ring-buffer every pose message for scan-time origin lookup."""
+    stamp_ns = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
+    pose_4x4 = _pose_msg_to_numpy(msg)
+    with self._pose_lock:
+      self._pose_buf.append((stamp_ns, pose_4x4))
+
+  def _lookup_origin(self, stamp_ns):
+    """Return (body position in world RDF, |dt| seconds) nearest to stamp_ns.
+
+    Returns None if no poses have been received yet.
+    """
+    with self._pose_lock:
+      buf = list(self._pose_buf)
+    if len(buf) == 0:
+      return None
+    diffs = [abs(t - stamp_ns) for t, _ in buf]
+    i = diffs.index(min(diffs))
+    body_4x4 = torch.tensor(buf[i][1], dtype=torch.float)
+    body_rdf = g3d.transform_pose_4x4(body_4x4, self.src2rdf)
+    return body_rdf[:3, 3].clone(), diffs[i] / 1e9
+
+  def _scan_msg_to_item(self, msg):
+    """Convert a PointCloud2 into a decoupled-mode scan item (or None).
+
+    Scans whose stamp is farther than origin_max_dt from any buffered pose
+    are dropped: carving free space from a wrong origin corrupts occupancy
+    (e.g. stale scans queued during encoder warmup, or bag-loop wraps).
+    """
+    stamp_ns = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
+    r = self._lookup_origin(stamp_ns)
+    if r is None:
+      return None  # No pose received yet.
+    origin, dt = r
+    if dt > self._origin_max_dt:
+      self._origin_skipped += 1
+      if self._origin_skipped == 1 or self._origin_skipped % 50 == 0:
+        logger.warning(
+          "Dropping scan: origin lookup off by %.2fs (> %.2fs). "
+          "%d scans dropped so far.",
+          dt, self._origin_max_dt, self._origin_skipped)
+      return None
+    xyz_world, _, _ = self._scan_to_world_points(msg, None, None)
+    if xyz_world is None:
+      return None
+    return dict(type="scan", pc_xyz=xyz_world, origin=origin)
 
   def _scan_to_world_points(self, pc_msg, pose_depth, body_rdf):
     """Parse a PointCloud2 and transform its valid points into world RDF.
@@ -893,7 +1034,45 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
 
   # ---------- Iterator ----------
 
+  def _iter_decoupled(self):
+    """Yields tagged scan/frame items for the decoupled pipeline.
+
+    Scans are drained first (geometry updates are cheap and should not lag),
+    then at most one synced RGB/pose frame is yielded per round.
+    """
+    while True:
+      # Drain pending scans.
+      while True:
+        try:
+          scan_msg = self._scan_queue.get_nowait()
+        except queue.Empty:
+          break
+        item = self._scan_msg_to_item(scan_msg)
+        if item is not None:
+          yield item
+
+      # Then at most one synced RGB/pose frame.
+      try:
+        msgs = self._frame_msgs_queue.get(block=True, timeout=0.2)
+      except queue.Empty:
+        if self._shutdown_event.is_set():
+          return
+        continue
+      msgs = dict(zip(self._subs.keys(), msgs))
+
+      body_4x4 = torch.tensor(
+        _pose_msg_to_numpy(msgs["pose"]), dtype=torch.float)
+      body_rdf = g3d.transform_pose_4x4(body_4x4, self.src2rdf)
+      pose_rgb = body_rdf @ self.T_body_rgb
+      rgb_img = self._parse_rectify_rgb(msgs["rgb"])
+
+      self._frame_out_idx += 1
+      yield dict(type="frame", rgb_img=rgb_img, pose_4x4=pose_rgb)
+
   def __iter__(self):
+    if self._decoupled_mode:
+      yield from self._iter_decoupled()
+      return
     while True:
       try:
         msgs = self._frame_msgs_queue.get(block=True, timeout=2)
@@ -910,45 +1089,8 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
       pose_rgb = body_rdf @ self.T_body_rgb
       pose_depth = body_rdf @ self.T_body_depth
 
-      # ---- Parse RGB ----
-      rgb_np = image_to_numpy(msgs["rgb"])
-      if rgb_np.ndim == 2:
-        rgb_np = np.stack([rgb_np] * 3, axis=-1)
-      elif rgb_np.shape[-1] == 4:
-        rgb_np = rgb_np[..., :3]
-
-      # On the first frame, ensure the undistortion maps were built for the
-      # actual stream resolution; rebuild them if the stream differs from what
-      # rgb_resolution / the calibration implied.
-      if not self._rgb_rect_verified:
-        h0, w0 = rgb_np.shape[0], rgb_np.shape[1]
-        if (w0, h0) != (self._rgb_proc_res[1], self._rgb_proc_res[0]):
-          logger.warning(
-            "RGB stream is %dx%d but rectification assumed %dx%d. Rebuilding "
-            "undistortion at the actual resolution; set rgb_resolution to "
-            "[%d, %d] so the mapper's intrinsics match the stream.",
-            w0, h0, self._rgb_proc_res[1], self._rgb_proc_res[0], h0, w0)
-          self._build_rgb_rectification(h0, w0)
-          self._rgb_proc_res = (h0, w0)
-        self._rgb_rect_verified = True
-
-      # Rectify / undistort RGB using calibrated intrinsics, if available.
-      if (getattr(self, "_rgb_dist_coeffs", None) is not None
-          and getattr(self, "_rgb_newK", None) is not None
-          and getattr(self, "_rgb_undist_roi", None) is not None):
-        undist = cv2.undistort(
-          rgb_np, self._rgb_K_orig, self._rgb_dist_coeffs,
-          None, self._rgb_newK)
-        x, y, rw, rh = self._rgb_undist_roi
-        undist = undist[y:y+rh, x:x+rw]
-        rgb_np = undist
-
-      # Flip BGR → RGB (VOXL typically publishes bgra8 or bgr8)
-      if rgb_np.shape[-1] == 3:
-        rgb_np = rgb_np[..., ::-1].copy()
-      rgb_img = torch.tensor(
-        rgb_np.astype(np.float32) / 255.0,
-        dtype=torch.float).permute(2, 0, 1)
+      # ---- Parse RGB (rectified + resized) ----
+      rgb_img = self._parse_rectify_rgb(msgs["rgb"])
 
       # ---- Get world points from depth source ----
       pc_debug_stats = None
@@ -1056,16 +1198,7 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
           f"depth_valid={depth_valid}",
           flush=True)
 
-      # ---- Optional resizing ----
-      if self.rgb_h > 0 and (
-          rgb_img.shape[-2] != self.rgb_h
-          or rgb_img.shape[-1] != self.rgb_w):
-        rgb_img = torch.nn.functional.interpolate(
-            rgb_img.unsqueeze(0), size=(self.rgb_h, self.rgb_w),
-            mode=self.interp_mode,
-            antialias=self.interp_mode in ("bilinear", "bicubic")
-        ).squeeze(0)
-
+      # ---- Optional resizing (RGB already resized in _parse_rectify_rgb) ----
       if self.depth_h > 0 and (
           reg_depth.shape[-2] != self.depth_h
           or reg_depth.shape[-1] != self.depth_w):

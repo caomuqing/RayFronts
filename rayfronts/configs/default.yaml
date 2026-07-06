@@ -18,6 +18,15 @@ hydra:
 # How many frames should be batched before processing.
 batch_size: 1
 
+# Decoupled geometry/semantics pipeline: geometry is built directly from point
+# cloud scans (dataset must yield tagged scan/frame items, e.g. StarlingMax
+# decoupled_mode) while semantic features are attached from RGB keyframes.
+decoupled_pipeline: False
+
+# In the decoupled pipeline, run the encoder + semantic fusion on every Nth
+# synced RGB/pose frame.
+semantic_keyframe_period: 5
+
 # Imposing a depth limit on the data such that to test limited depth scenarios
 # Set to a negative number to not use a limit
 depth_limit: -1

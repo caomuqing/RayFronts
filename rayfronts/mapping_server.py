@@ -276,8 +276,132 @@ class MappingServer:
       self.messaging_service.publish_pc(
           mapper.frontiers, features=features, layer="frontiers")
 
+  def _post_mapping_loop(self):
+    """Transition to idling (if messaging is up) or shutdown after mapping."""
+    self._status_lock.acquire()
+    if self.status == MappingServer.Status.MAPPING:
+      if self.messaging_service is not None:
+        self.status = MappingServer.Status.IDLE
+        try:
+          self.dataset.shutdown()
+        except AttributeError:
+          pass # Its fine dataset doesn't have shutdown function
+      else:
+        self._status_lock.release()
+        self.shutdown()
+        return
+
+    # No new data is coming so we only need to add new queries and not
+    # update old ones. Unless compute_prob is set to true b.c new queries
+    # will not affect old results.
+    if not self.cfg.querying.compute_prob:
+      self._queries_feats = None
+      self._queries_labels.clear()
+    # Idling loop
+    while self.status == MappingServer.Status.IDLE:
+      self._status_lock.release()
+      time.sleep(1)
+      with self._query_lock:
+        if self._queries_updated:
+          self.run_queries()
+      self._status_lock.acquire()
+
+    self.status = MappingServer.Status.CLOSED
+    self._status_lock.release()
+    self.shutdown()
+
+  @torch.inference_mode()
+  def _run_decoupled(self):
+    """Run loop for the decoupled geometry/semantics pipeline.
+
+    Expects the dataset to yield tagged items: {"type": "scan", "pc_xyz",
+    "origin"} for geometry and {"type": "frame", "rgb_img", "pose_4x4"} for
+    synced RGB/pose pairs. Geometry updates run on every scan; the encoder +
+    semantic fusion run on every semantic_keyframe_period-th frame.
+    """
+    kf_period = max(1, int(self.cfg.semantic_keyframe_period))
+    n_scans = n_frames = n_kf = 0
+    total_geo = total_sem = 0.0
+    t_start = time.time()
+
+    with self._status_lock:
+      if self.status == MappingServer.Status.INIT:
+        self.status = MappingServer.Status.MAPPING
+        logger.info("Datastream opened. Starting decoupled mapping "
+                    "(semantic keyframe period: %d).", kf_period)
+
+    for item in self.dataset:
+      if item is None:
+        break
+
+      if item["type"] == "scan":
+        t0 = time.time()
+        self.mapper.process_pointcloud(item["pc_xyz"], item["origin"])
+        total_geo += time.time() - t0
+        n_scans += 1
+
+      elif item["type"] == "frame":
+        n_frames += 1
+        pose_4x4 = item["pose_4x4"]
+        if self.vis is not None:
+          if (self.cfg.vis.pose_period > 0
+              and n_frames % self.cfg.vis.pose_period == 0):
+            self.vis.log_pose(pose_4x4)
+          # Map vis ticks on frames (not keyframes) so occupancy/frontiers
+          # built from scans show up promptly even between keyframes.
+          if (self.cfg.vis.map_period > 0
+              and n_frames % self.cfg.vis.map_period == 0):
+            self.mapper.vis_map()
+
+        if (n_frames - 1) % kf_period == 0:
+          n_kf += 1
+          rgb_img = item["rgb_img"].unsqueeze(0)
+          t0 = time.time()
+          r = self.mapper.process_semantic_frame(rgb_img, pose_4x4)
+          sem_p = time.time() - t0
+          total_sem += sem_p
+
+          if self.vis is not None:
+            if (self.cfg.vis.input_period > 0
+                and n_kf % self.cfg.vis.input_period == 0):
+              self.vis.log_img(item["rgb_img"].permute(1, 2, 0))
+              self.mapper.vis_update(**r)
+
+          if (self.cfg.querying.period > 0
+              and n_kf % self.cfg.querying.period == 0):
+            self.run_queries()
+
+          if (self.messaging_service is not None
+              and self.cfg.messaging_publish_period > 0
+              and n_kf % self.cfg.messaging_publish_period == 0):
+            self._publish_map_pc()
+
+          logger.info(
+            "[kf #%4d#] scans=#%d# frames=#%d# semantic (#%6.4f# ms)",
+            n_kf, n_scans, n_frames, sem_p*1e3)
+
+        if self.vis is not None:
+          self.vis.step()
+
+      with self._status_lock:
+        if self.status != MappingServer.Status.MAPPING:
+          logger.info("Mapping stopped.")
+          break
+
+    total_wall = time.time() - t_start
+    if total_wall > 0:
+      logger.info(
+        "Decoupled totals: scans=#%d# (geometry #%6.4f#s), frames=#%d#, "
+        "keyframes=#%d# (semantics #%6.4f#s), wall #%6.2f#s",
+        n_scans, total_geo, n_frames, n_kf, total_sem, total_wall)
+
+    self._post_mapping_loop()
+
   @torch.inference_mode()
   def run(self):
+    if getattr(self.cfg, "decoupled_pipeline", False):
+      self._run_decoupled()
+      return
     total_wall_t0 = time.time()
     total_map = 0
     total_frames_processed = 0
@@ -393,37 +517,7 @@ class MappingServer:
                   total_map, total_frames_processed/total_map,
                   total_map/total_wall*100)
 
-    # Shutting down or transitioning to idling
-    self._status_lock.acquire()
-    if self.status == MappingServer.Status.MAPPING:
-      if self.messaging_service is not None:
-        self.status = MappingServer.Status.IDLE
-        try:
-          self.dataset.shutdown()
-        except AttributeError:
-          pass # Its fine dataset doesn't have shutdown function
-      else:
-        self.shutdown()
-        return
-
-    # No new data is coming so we only need to add new queries and not
-    # update old ones. Unless compute_prob is set to true b.c new queries
-    # will not affect old results.
-    if not self.cfg.querying.compute_prob:
-      self._queries_feats = None
-      self._queries_labels.clear()
-    # Idling loop
-    while self.status == MappingServer.Status.IDLE:
-      self._status_lock.release()
-      time.sleep(1)
-      with self._query_lock:
-        if self._queries_updated:
-          self.run_queries()
-      self._status_lock.acquire()
-
-    self.status = MappingServer.Status.CLOSED
-    self._status_lock.release()
-    self.shutdown()
+    self._post_mapping_loop()
 
   def shutdown(self):
     with self._status_lock:

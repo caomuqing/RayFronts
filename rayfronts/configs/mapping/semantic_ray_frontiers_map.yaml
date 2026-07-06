@@ -113,6 +113,16 @@ infer_direction: False
 # in self.frontiers_neighbor_cnts.
 keep_frontier_neighbor_cnts: False
 
+# Decoupled pipeline only (process_semantic_frame): a voxel is considered
+# visible if its camera depth is within visibility_tolerance*vox_size of the
+# closest voxel projecting to the same pixel.
+visibility_tolerance: 1.0
+
+# A semantic coverage frontier cluster is flagged only if at least this
+# fraction of its occupied voxels is unlabeled (in addition to the
+# fronti_subsampling_min_fronti count threshold).
+coverage_min_unlabeled_frac: 0.5
+
 # If > 0, prints mapper point/voxel stats every N processed batches.
 debug_log_period: 0
 

@@ -704,6 +704,146 @@ def depth_to_sparse_occupancy_voxels(depth_img: torch.FloatTensor,
 
   return tuple(return_vals)
 
+def splat_min_zbuffer(u: torch.LongTensor,
+                      v: torch.LongTensor,
+                      z: torch.FloatTensor,
+                      r_px: torch.LongTensor,
+                      resolution: Tuple[int, int],
+                      r_max: int = 12) -> torch.FloatTensor:
+  """Rasterizes points into a min-depth buffer with square splat footprints.
+
+  Unlike a single-pixel z-buffer, each point occludes a (2r+1)x(2r+1) pixel
+  square around its projection, so sparse voxel centers form a closed
+  occluding surface instead of isolated dots.
+
+  Args:
+    u: N long tensor of pixel columns (already in bounds).
+    v: N long tensor of pixel rows (already in bounds).
+    z: N float tensor of camera depths.
+    r_px: N long tensor of splat radii in pixels (e.g. half the projected
+      voxel footprint). Clamped to [1, r_max].
+    resolution: (H, W) of the buffer.
+    r_max: Hard cap on the splat radius to bound memory. Very close points
+      (true footprint > 2*r_max+1) will under-occlude.
+
+  Returns:
+    HxW float tensor of minimum depth per pixel; +inf where nothing splats.
+  """
+  H, W = resolution
+  device = z.device
+  r_px = r_px.clamp(min=1, max=r_max)
+  o = torch.arange(-r_max, r_max+1, device=device)
+  du, dv = torch.meshgrid(o, o, indexing="xy")
+  du = du.flatten()
+  dv = dv.flatten()  # O = (2*r_max+1)^2
+  cheb = torch.maximum(du.abs(), dv.abs())  # O
+
+  mask = cheb.reshape(1, -1) <= r_px.reshape(-1, 1)  # NxO
+  uu = u.reshape(-1, 1) + du.reshape(1, -1)
+  vv = v.reshape(-1, 1) + dv.reshape(1, -1)
+  mask &= (uu >= 0) & (uu < W) & (vv >= 0) & (vv < H)
+
+  idx = (vv * W + uu)[mask]
+  vals = z.reshape(-1, 1).expand(-1, du.shape[0])[mask]
+  zbuf = torch.full((H*W,), torch.inf, device=device, dtype=torch.float)
+  zbuf.scatter_reduce_(0, idx, vals, reduce="amin", include_self=False)
+  return zbuf.reshape(H, W)
+
+def pointcloud_to_sparse_occupancy_voxels(pc_xyz: torch.FloatTensor,
+                                          origin_xyz: torch.FloatTensor,
+                                          vox_size: float,
+                                          max_num_pts: int = -1,
+                                          max_num_empty_pts: int = -1,
+                                          occ_thickness: int = 1):
+  """Computes sparse occupancy voxels from a point cloud and its sensor origin.
+
+  Point cloud analog of depth_to_sparse_occupancy_voxels (ray_sampling
+  algorithm): the points mark occupied voxels and free space is carved by
+  sampling along each ray origin->point with vox_size/2 spacing. Use this when
+  geometry comes directly from a (e.g. LiDAR) point cloud instead of a depth
+  image.
+
+  Args:
+    pc_xyz: Nx3 float tensor of points in world coordinates.
+    origin_xyz: Float tensor of size 3 describing the sensor origin in world
+      coordinates. Used as the start point for free space carving.
+    vox_size: Metric size of the voxel.
+    max_num_pts: Maximum number of occupied points to project. Set to -1 to
+      project all.
+    max_num_empty_pts: Maximum number of empty points to project. Set to -1 to
+      project all.
+    occ_thickness: How many points to project as occupied per input point,
+      centered on the point along its ray with vox_size/2 spacing. Same role
+      as in depth_to_sparse_occupancy_voxels.
+
+  Returns:
+    xyz_vx: Kx3 float tensor of voxel centers.
+    occupancy_vx: Kx1 float tensor with occupancy discretized as 0 for empty
+      and 1 for occupied. Matches depth_to_sparse_occupancy_voxels semantics.
+  """
+  device = pc_xyz.device
+  origin_xyz = origin_xyz.to(device).reshape(1, 3)
+
+  min_depth = vox_size / 2
+  rays = pc_xyz - origin_xyz
+  dist = torch.norm(rays, dim=-1)
+  valid = torch.isfinite(dist) & (dist > min_depth)
+  if not valid.any():
+    # No usable points; return a single empty voxel at the sensor origin
+    # (mirrors the no-finite-depth behaviour of the depth version).
+    xyz_vx = pointcloud_to_sparse_voxels(origin_xyz, vox_size=vox_size)
+    occupancy_vx = torch.zeros(1, 1, device=device)
+    return xyz_vx, occupancy_vx
+
+  pc_xyz = pc_xyz[valid]
+  rays = rays[valid]
+  dist = dist[valid].unsqueeze(-1)  # Nx1
+  dirs = rays / dist  # Nx3 unit directions
+
+  ## Occupied points: occ_thickness samples centered on the point along ray
+  assert occ_thickness >= 1
+  depth_step = vox_size / 2
+  depth_modifiers = torch.linspace(
+    torch.tensor(-depth_step*(occ_thickness-1)/2),
+    torch.tensor(+depth_step*(occ_thickness-1)/2),
+    occ_thickness, device=device, dtype=torch.float)  # L
+  # NxLx3 = origin + (d + m) * u
+  occ_t = (dist + depth_modifiers.reshape(1, -1)).unsqueeze(-1)  # NxLx1
+  world_occ_pts_xyz = (origin_xyz.reshape(1, 1, 3) +
+                       occ_t * dirs.unsqueeze(1)).reshape(-1, 3)
+
+  if max_num_pts > 0 and max_num_pts < world_occ_pts_xyz.shape[0]:
+    sel = torch.randperm(world_occ_pts_xyz.shape[0],
+                         device=device)[:max_num_pts]
+    world_occ_pts_xyz = world_occ_pts_xyz[sel]
+
+  ## Empty points: sample along each ray strictly before the surface
+  sampled_depths = torch.arange(min_depth, dist.max(), vox_size/2,
+                                device=device)  # S
+  # NxSx3 sample positions; mask samples beyond each ray's surface distance
+  empty_mask = sampled_depths.reshape(1, -1) < dist  # NxS
+  world_empty_pts_xyz = (origin_xyz.reshape(1, 1, 3) +
+                         sampled_depths.reshape(1, -1, 1) *
+                         dirs.unsqueeze(1))  # NxSx3
+  world_empty_pts_xyz = world_empty_pts_xyz[empty_mask]
+
+  if (max_num_empty_pts > 0 and
+      max_num_empty_pts < world_empty_pts_xyz.shape[0]):
+    sel = torch.randperm(world_empty_pts_xyz.shape[0],
+                         device=device)[:max_num_empty_pts]
+    world_empty_pts_xyz = world_empty_pts_xyz[sel]
+
+  ## Voxelize: occupied evidence dominates mixed voxels (sum then clamp).
+  occupancy_pts = torch.vstack(
+    [torch.ones_like(world_occ_pts_xyz[..., -1:]),
+     torch.zeros_like(world_empty_pts_xyz[..., -1:])])
+  xyz_pts = torch.vstack([world_occ_pts_xyz, world_empty_pts_xyz])
+  xyz_vx, occupancy_vx = pointcloud_to_sparse_voxels(
+    xyz_pts, vox_size, feat_pc=occupancy_pts, aggregation="sum")
+  occupancy_vx = torch.clamp(occupancy_vx, max=1)
+
+  return xyz_vx, occupancy_vx
+
 def pts_to_plane(pts: torch.FloatTensor):
   """Computes the plane that the 3 points lie on.
 

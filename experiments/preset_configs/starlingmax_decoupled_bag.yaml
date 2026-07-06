@@ -1,0 +1,70 @@
+# Preset for ../Datasets/rosbag2_2026_07_01-23_52_59 using the DECOUPLED
+# geometry/semantics pipeline.
+#
+# Geometry: every /registered_scan (world frame, superodom_map) is ingested
+# directly as a point cloud — occupied voxels at the points, free space carved
+# from the scan-time body position (looked up from /odom_px4_fused). No
+# registered depth image is rendered.
+# Semantics: every semantic_keyframe_period-th synced RGB/pose frame is
+# encoded (RadSeg) and its features are attached to visible occupied voxels
+# (z-buffer visibility test). Occupied-but-unlabeled voxels are published as
+# "semantic_coverage_frontiers".
+#
+# Usage from the repository root:
+#   ros2 bag play ../Datasets/rosbag2_2026_07_01-23_52_59 --loop
+#   python3 -m rayfronts.mapping_server --config-dir experiments/preset_configs --config-name starlingmax_decoupled_bag
+
+defaults:
+  - default
+  - override dataset: starlingmax
+  - override encoder: radseg
+  - override mapping: semantic_ray_frontiers_map
+  - override vis: rerun
+  - override messaging_service: ros
+
+bag_dir: ../Datasets/rosbag2_2026_07_01-23_52_59
+calibration_dir: ../Datasets/starlingmax_2026_06_24_160055/calibration
+
+decoupled_pipeline: true
+semantic_keyframe_period: 5
+
+dataset:
+  rgb_topic: "/hires_front_small_color"
+  pose_topic: "/odom_px4_fused"
+  pose_msg_type: "odometry"
+
+  depth_topic: null
+  depth_intrinsics_file: null
+  point_cloud_topic: "/registered_scan"
+  point_cloud_frame: "world"
+  point_cloud_to_world_transform:
+    [0.0, 0.0, 0.0, 0.1800308, -0.1800308, 0.6838047, -0.6838047]
+  decoupled_mode: true
+  confidence_topic: null
+  # sync_slop governs the RGB<->pose match only (scans are decoupled).
+  sync_queue_size: 150
+  sync_slop: 0.1
+
+  intrinsics_file: ${calibration_dir}/intrinsics.txt
+  extrinsics_conf_path: ${calibration_dir}/extrinsics.conf
+  rgb_frame_name: "hires_front"
+  depth_frame_name: "tof"
+
+  src_coord_system: "frd"
+  extrinsics_coord_system: "frd"
+
+  rgb_resolution: [480, 640]
+  depth_resolution: [480, 640]
+  frame_skip: 0
+
+mapping:
+  occ_thickness: 2
+  # Carving all ~20k rays per scan is heavy; subsample empty samples per scan.
+  max_empty_pts_per_frame: 500000
+  debug_log_period: 10
+
+querying:
+  text_query_mode: labels
+  query_file: experiments/indoor_semantic_queries.json
+  compute_prob: True
+  period: 10
