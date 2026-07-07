@@ -3,7 +3,7 @@ defaults:
 
 _target_: rayfronts.mapping.SemanticRayFrontiersMap
 
-vox_size: 0.15
+vox_size: 0.20
 
 # How often do we aggregate voxels into the global representation.
 # Setting to 10, will accumulate point clouds from 10 frames before 
@@ -122,6 +122,21 @@ visibility_tolerance: 1.0
 # fraction of its occupied voxels is unlabeled (in addition to the
 # fronti_subsampling_min_fronti count threshold).
 coverage_min_unlabeled_frac: 0.5
+
+# Class-specific frontiers: boundary between voxels classified as these
+# classes (argmax over the active query set) and occupied-but-unlabeled or
+# frontier-adjacent unknown space. Labels must be part of the query set.
+# Set to null to disable. e.g. ["ground"]
+class_frontier_classes: null
+# Minimum argmax softmax probability for a voxel to count as a target class.
+class_frontier_min_prob: 0.4
+# Clustering factor (x vox_size) and minimum boundary voxels per cluster.
+class_frontier_subsampling: 3
+class_frontier_min_cnt: 4
+# Keep, per lateral (x,z) column, only boundary voxels at the class's top
+# surface (removes points beneath e.g. the ground adjacent to its
+# unphotographable interior). Set to False for vertical classes like walls.
+class_frontier_top_surface_only: True
 
 # If > 0, prints mapper point/voxel stats every N processed batches.
 debug_log_period: 0

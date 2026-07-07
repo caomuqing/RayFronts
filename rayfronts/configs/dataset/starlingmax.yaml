@@ -77,6 +77,17 @@ confidence_topic: null
 sync_queue_size: 50
 sync_slop: 0.3
 
+# If > 0, log every N received RGB images the stamp difference to the closest
+# pose — including images the synchronizer rejects (diff > sync_slop).
+# Useful for tuning sync_slop. Set to 0 to disable.
+sync_debug_log_period: 30
+
+# Seconds added to every RGB image stamp before time sync
+# (corrected = stamp + offset). If the camera stamps images later than the
+# actual exposure (typical driver latency), set a negative value roughly equal
+# to that latency so the matched pose corresponds to the exposure time.
+rgb_stamp_offset: 0.0
+
 # If > 0, prints PointCloud2 projection stats every N yielded frames.
 point_cloud_debug_log_period: 0
 

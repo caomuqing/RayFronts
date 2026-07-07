@@ -252,6 +252,14 @@ class MappingServer:
           if r is not None and self.messaging_service is not None:
             self.messaging_service.publish_query_results(r, query_labels=v)
 
+        # Class-specific frontiers use the text query set for classification.
+        if (hasattr(self.mapper, "update_class_frontiers")
+            and self._queries_feats.get("text", None) is not None
+            and len(self._queries_labels.get("text", [])) > 0):
+          self.mapper.update_class_frontiers(
+            self._queries_feats["text"], self._queries_labels["text"],
+            compressed=self.cfg.querying.compressed)
+
         self._queries_updated = False
       with self._status_lock:
         if (self.status == MappingServer.Status.IDLE and

@@ -139,6 +139,11 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
                keep_frontier_neighbor_cnts: bool = False,
                visibility_tolerance: float = 1.0,
                coverage_min_unlabeled_frac: float = 0.5,
+               class_frontier_classes: List[str] = None,
+               class_frontier_min_prob: float = 0.4,
+               class_frontier_subsampling: int = 3,
+               class_frontier_min_cnt: int = 4,
+               class_frontier_top_surface_only: bool = True,
                debug_log_period: int = 0):
     """
     Args:
@@ -225,6 +230,22 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
         if the unlabeled fraction of its occupied voxels is at least this
         value (in addition to the fronti_subsampling_min_fronti count), so
         partially labeled surfaces are not flagged.
+      class_frontier_classes: List of class labels (must be part of the active
+        query set) whose boundary is computed as class frontiers: voxels
+        classified as these classes that are adjacent to occupied-but-unlabeled
+        voxels or to raw geometric frontier cells. Set to None to disable.
+      class_frontier_min_prob: Minimum softmax probability of the argmax class
+        for a voxel to be considered part of a target class.
+      class_frontier_subsampling: Clustering factor (x vox_size) for class
+        frontier boundary voxels.
+      class_frontier_min_cnt: Minimum boundary voxels per cluster cell for the
+        cell to be kept as a class frontier point.
+      class_frontier_top_surface_only: Keep, per lateral (x,z) column, only
+        boundary voxels at the class's top surface, removing boundary points
+        beneath it (e.g. sub-surface floor voxels adjacent to the unlabeled
+        interior of the ground). Right for horizontal-surface classes such as
+        ground/floor; set to False for vertical classes such as walls where
+        boundaries below the top edge are meaningful.
       debug_log_period: If > 0, print mapper point/voxel stats every N calls.
     """
     super().__init__(intrinsics_3x3, device, visualizer, clip_bbox, encoder,
@@ -269,6 +290,13 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     self.keep_frontier_neighbor_cnts = keep_frontier_neighbor_cnts
     self.visibility_tolerance = float(visibility_tolerance)
     self.coverage_min_unlabeled_frac = float(coverage_min_unlabeled_frac)
+    self.class_frontier_classes = list(class_frontier_classes) \
+      if class_frontier_classes is not None else []
+    self.class_frontier_min_prob = float(class_frontier_min_prob)
+    self.class_frontier_subsampling = int(class_frontier_subsampling)
+    self.class_frontier_min_cnt = int(class_frontier_min_cnt)
+    self.class_frontier_top_surface_only = bool(class_frontier_top_surface_only)
+    self._class_frontier_warned = False
     # TEMP(viz-only): height band (min, max) in metres for all voxel/frontier
     # visualization layers. Up = -y in world RDF, relative to world origin.
     # Set to None to visualize everything again. Does NOT affect the map,
@@ -302,6 +330,15 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     # boundaries of camera semantic coverage. See
     # update_semantic_coverage_frontiers.
     self.semantic_coverage_frontiers = None
+    # Kx3 clustered boundary points of the selected semantic classes.
+    # See update_class_frontiers.
+    self.class_frontiers = None
+    # Raw (pre-subsampling) geometric frontier cells at vox_size resolution.
+    # Maintained by update_frontiers; used for class-frontier adjacency.
+    self._frontiers_raw = None
+    # Nx3 occupied-but-unlabeled voxel centers cached by
+    # update_semantic_coverage_frontiers; used for class-frontier adjacency.
+    self._unlabeled_occ_xyz = None
     # Mx(3+2) 3 for origin and 2 for angle
     self.global_rays_orig_angles = None
     # Mx(C+1) C for features, 1 for count.
@@ -750,6 +787,7 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     """
     if occupied_centers is None or occupied_centers.shape[0] == 0:
       self.semantic_coverage_frontiers = None
+      self._unlabeled_occ_xyz = None
       return
     if self.global_vox_xyz is None or self.global_vox_xyz.shape[0] == 0:
       occ_cells = occupied_centers
@@ -760,6 +798,9 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
       keep = flag >= 0  # 1 = occupied only (unlabeled), 0 = occupied+labeled
       occ_cells = union[keep]
       unlabeled_flag = (flag[keep] == 1).float().unsqueeze(-1)
+
+    # Cache for class-frontier adjacency (condition 1).
+    self._unlabeled_occ_xyz = occ_cells[unlabeled_flag.squeeze(-1) == 1]
 
     if occ_cells.shape[0] == 0 or unlabeled_flag.sum() == 0:
       self.semantic_coverage_frontiers = None
@@ -786,6 +827,135 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     else:
       self.semantic_coverage_frontiers = \
         occ_cells[unlabeled_flag.squeeze(-1) == 1]
+
+  def update_class_frontiers(self,
+                             query_feats: torch.FloatTensor,
+                             query_labels: List[str],
+                             compressed: bool = False) -> None:
+    """Compute boundary frontiers of the selected semantic classes.
+
+    A boundary voxel is a semantic voxel classified (argmax over the active
+    query set, with a minimum probability) as one of class_frontier_classes
+    that is adjacent (26-neighborhood) to either
+    (1) an occupied-but-unlabeled voxel (cached by
+        update_semantic_coverage_frontiers), or
+    (2) a raw geometric frontier cell (empty bordering unobserved; maintained
+        by update_frontiers). Frontier-adjacency naturally excludes sealed
+        unknown space such as under-floor cells.
+    Boundary voxels are clustered into self.class_frontiers (single merged
+    layer).
+
+    Args:
+      query_feats: QxD float tensor of the active query features.
+      query_labels: List of Q labels aligned with query_feats.
+      compressed: Whether query_feats (and comparison) are in compressed
+        feature space. Mirrors feature_query.
+    """
+    if len(self.class_frontier_classes) == 0:
+      return
+    if (self.global_vox_xyz is None or self.global_vox_xyz.shape[0] == 0 or
+        query_feats is None or len(query_labels) == 0):
+      self.class_frontiers = None
+      return
+
+    targets = set(self.class_frontier_classes)
+    target_idx = [i for i, l in enumerate(query_labels) if l in targets]
+    if len(target_idx) == 0:
+      if not self._class_frontier_warned:
+        logger.warning(
+          "class_frontier_classes %s not found in query set %s; class "
+          "frontiers disabled until those queries are added.",
+          self.class_frontier_classes, list(query_labels))
+        self._class_frontier_warned = True
+      return
+
+    # Classify semantic voxels by argmax over the query set (same feature
+    # handling as feature_query).
+    vox_feat = self.global_vox_feat
+    if self.feat_compressor is not None and not compressed:
+      vox_feat = self.feat_compressor.decompress(vox_feat)
+    vox_feat = self.encoder.align_spatial_features_with_language(
+      vox_feat.unsqueeze(-1).unsqueeze(-1)).squeeze(-1).squeeze(-1)
+    prob = compute_cos_sim(query_feats, vox_feat, softmax=True)  # Nv x Q
+    best_prob, best_cls = prob.max(dim=-1)
+    target_mask = torch.isin(
+      best_cls, torch.tensor(target_idx, device=best_cls.device))
+    if self.class_frontier_min_prob > 0:
+      target_mask &= best_prob >= self.class_frontier_min_prob
+    cls_xyz = self.global_vox_xyz[target_mask]
+    if cls_xyz.shape[0] == 0:
+      self.class_frontiers = None
+      return
+
+    # Adjacency sets: (1) occupied-but-unlabeled, (2) raw frontier cells.
+    adj_sets = []
+    if (self._unlabeled_occ_xyz is not None and
+        self._unlabeled_occ_xyz.shape[0] > 0):
+      adj_sets.append(self._unlabeled_occ_xyz.to(cls_xyz.device))
+    if self._frontiers_raw is not None and self._frontiers_raw.shape[0] > 0:
+      adj_sets.append(self._frontiers_raw.to(cls_xyz.device))
+    if len(adj_sets) == 0:
+      self.class_frontiers = None
+      return
+    adj = g3d.pointcloud_to_sparse_voxels(
+      torch.cat(adj_sets, dim=0), self.vox_size)
+    if self.class_frontier_top_surface_only:
+      # Surface-class mode: cells directly BENEATH a class voxel must not
+      # flag it (the interior of a thick floor is unphotographable, not a
+      # frontier). Dilate the adjacency set with lateral and downward offsets
+      # only (up = -y), so only lateral/above unknown-ness creates boundary.
+      o = torch.arange(-1, 2, device=adj.device,
+                       dtype=adj.dtype) * self.vox_size
+      ox, oy, oz = torch.meshgrid(o, o, o, indexing="xy")
+      offs = torch.stack([ox, oy, oz], dim=-1).reshape(-1, 3)
+      offs = offs[offs[:, 1] >= 0]  # drop upward (-y) offsets
+      adj_dilated = g3d.pointcloud_to_sparse_voxels(
+        (adj.reshape(-1, 1, 3) + offs.reshape(1, -1, 3)).reshape(-1, 3),
+        self.vox_size)
+    else:
+      adj_dilated = g3d.dilate_sparse_voxels(adj, self.vox_size, r=1)
+
+    # Class voxels that fall inside the dilated adjacency set are boundary.
+    union, flag = g3d.intersect_voxels(cls_xyz, adj_dilated, self.vox_size)
+    boundary = union[flag == 0]
+    if boundary.shape[0] == 0:
+      self.class_frontiers = None
+      return
+
+    if self.class_frontier_top_surface_only:
+      # Keep only boundary voxels at the class top surface of their lateral
+      # (x, z) column; drops boundary points beneath the class (e.g. voxels
+      # inside a thick floor adjacent to its unphotographable interior).
+      # World RDF: up = -y, so the column top is the minimum y.
+      m = 2**20  # column hash multiplier (lateral index range guard)
+      cls_col = torch.round(cls_xyz[:, [0, 2]] / self.vox_size).long()
+      cls_h = cls_col[:, 0] * m + cls_col[:, 1]
+      uniq_h, inv = torch.unique(cls_h, return_inverse=True)
+      top_y = torch.full((uniq_h.shape[0],), torch.inf,
+                         device=cls_xyz.device, dtype=cls_xyz.dtype)
+      top_y.scatter_reduce_(0, inv, cls_xyz[:, 1], reduce="amin",
+                            include_self=False)
+      b_col = torch.round(boundary[:, [0, 2]] / self.vox_size).long()
+      b_h = b_col[:, 0] * m + b_col[:, 1]
+      pos = torch.searchsorted(uniq_h, b_h).clamp(max=uniq_h.shape[0] - 1)
+      col_found = uniq_h[pos] == b_h
+      # Allow only the top voxel layer (0.6 * vox margin).
+      boundary = boundary[col_found &
+                          (boundary[:, 1] <= top_y[pos] + 0.6*self.vox_size)]
+      if boundary.shape[0] == 0:
+        self.class_frontiers = None
+        return
+
+    # Cluster boundary voxels into frontier points.
+    if self.class_frontier_subsampling > 1:
+      feat = torch.ones_like(boundary[:, 0:1])
+      clustered, cnt = g3d.pointcloud_to_sparse_voxels(
+        boundary, vox_size=self.vox_size*self.class_frontier_subsampling,
+        feat_pc=feat, aggregation="sum")
+      clustered = clustered[cnt[:, 0] >= self.class_frontier_min_cnt]
+      self.class_frontiers = clustered if clustered.shape[0] > 0 else None
+    else:
+      self.class_frontiers = boundary
 
   def cast_semantic_rays(self) -> None:
     """Cast semantic rays accumulated in the temporary buffers onto frontiers.
@@ -1053,6 +1223,18 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
       return_cnts = self.keep_frontier_neighbor_cnts,
     ).to(self.device)
 
+    # Keep raw (pre-subsampling) frontier cells for class-frontier adjacency,
+    # with the same replace-inside-active-window update as below.
+    raw_update = frontiers_update[:, :3].clone()
+    if self._frontiers_raw is None:
+      self._frontiers_raw = raw_update
+    else:
+      outside_mask = torch.logical_or(
+        torch.any(self._frontiers_raw < active_bbox_min, dim=-1),
+        torch.any(self._frontiers_raw > active_bbox_max, dim=-1))
+      self._frontiers_raw = torch.cat(
+        [self._frontiers_raw[outside_mask], raw_update], dim=0)
+
     # Subsample frontiers using voxel grid
     if self.fronti_subsampling > 1:
       feat = torch.ones_like(frontiers_update[:, 0:1])
@@ -1223,6 +1405,18 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
           cov.shape[0], 3)
         self.visualizer.log_pc(cov, cov_rgb,
                                layer="semantic_coverage_frontiers")
+
+    # Vis class-specific frontiers (boundary of the selected semantic classes
+    # against unlabeled/unknown space). Fixed magenta.
+    if self.class_frontiers is not None and self.class_frontiers.shape[0] > 0:
+      cf = self.class_frontiers
+      m = self._vis_height_mask(cf)
+      if m is not None:
+        cf = cf[m]
+      if cf.shape[0] > 0:
+        cf_rgb = torch.tensor([[0.85, 0.1, 0.9]], device=cf.device).expand(
+          cf.shape[0], 3)
+        self.visualizer.log_pc(cf, cf_rgb, layer="class_frontiers")
 
     # Vis rays
     if (self.global_rays_orig_angles is not None and

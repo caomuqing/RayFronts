@@ -514,6 +514,8 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
                frame_skip=0,
                sync_queue_size=50,
                sync_slop=0.3,
+               sync_debug_log_period=30,
+               rgb_stamp_offset=0.0,
                point_cloud_debug_log_period=0,
                interp_mode="bilinear"):
     """
@@ -582,6 +584,16 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
       frame_skip: See base.
       sync_queue_size: Number of messages buffered for approximate time sync.
       sync_slop: Maximum timestamp difference in seconds for sync matching.
+      sync_debug_log_period: If > 0, log every N received RGB images the stamp
+        difference to the closest pose seen so far — including images the
+        synchronizer rejects (difference > sync_slop). Useful for tuning
+        sync_slop. Set to 0 to disable.
+      rgb_stamp_offset: Seconds added to every RGB image header stamp before
+        time synchronization (corrected = stamp + offset). Use this to
+        compensate camera stamping latency: if the driver stamps images later
+        than the actual exposure (typical), set a negative value roughly equal
+        to that latency so the matched pose corresponds to the exposure time.
+        Applies to sync matching and the sync debug log.
       point_cloud_debug_log_period: If > 0, print point cloud projection stats
         every N yielded frames.
       interp_mode: See base.
@@ -618,6 +630,11 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     pose_msg_cls = pose_msg_classes[pose_msg_type]
     sync_queue_size = int(sync_queue_size)
     sync_slop = float(sync_slop)
+    self._sync_slop = sync_slop
+    self._sync_debug_log_period = int(sync_debug_log_period)
+    self._rgb_stamp_offset_ns = int(round(float(rgb_stamp_offset) * 1e9))
+    self._rgb_stamp_cnt = 0
+    self._rgb_pose_diffs = []
 
     self._depth_max_range = float(depth_max_range)
     self._use_point_cloud = has_pc
@@ -776,9 +793,36 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
         pose=message_filters.Subscriber(
           self._rosnode, pose_msg_cls, pose_topic, qos_profile=_qos),
     )
-    if self._decoupled_mode:
-      # Side-tap every pose (not only synced ones) to look up scan origins.
-      self._subs["pose"].registerCallback(self._cache_pose)
+
+    # Optionally shift RGB stamps before the synchronizer (and diagnostics)
+    # see them, so matching happens against the actual exposure time.
+    if self._rgb_stamp_offset_ns != 0:
+      offset_ns = self._rgb_stamp_offset_ns
+
+      class _RgbStampOffsetFilter(message_filters.SimpleFilter):
+        def __init__(self, upstream):
+          super().__init__()
+          upstream.registerCallback(self._shift)
+
+        def _shift(self, msg):
+          t = (msg.header.stamp.sec * 10**9
+               + msg.header.stamp.nanosec + offset_ns)
+          t = max(t, 0)
+          msg.header.stamp.sec = int(t // 10**9)
+          msg.header.stamp.nanosec = int(t % 10**9)
+          self.signalMessage(msg)
+
+      self._subs["rgb"] = _RgbStampOffsetFilter(self._subs["rgb"])
+      logger.info("Applying RGB stamp offset of %+.3fs before time sync.",
+                  self._rgb_stamp_offset_ns / 1e9)
+
+    # Side-tap every pose (not only synced ones): used for scan-origin lookup
+    # in decoupled mode and for RGB<->pose stamp-diff diagnostics.
+    self._subs["pose"].registerCallback(self._cache_pose)
+    if self._sync_debug_log_period > 0:
+      # Side-tap every RGB message to report its closest-pose stamp gap,
+      # including images the synchronizer will reject (gap > sync_slop).
+      self._subs["rgb"].registerCallback(self._log_rgb_pose_stamp_diff)
     if has_depth_img:
       self._subs["depth"] = message_filters.Subscriber(
           self._rosnode, Image, depth_topic, qos_profile=_qos)
@@ -960,6 +1004,35 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     pose_4x4 = _pose_msg_to_numpy(msg)
     with self._pose_lock:
       self._pose_buf.append((stamp_ns, pose_4x4))
+
+  def _log_rgb_pose_stamp_diff(self, msg):
+    """Log the stamp gap between each RGB image and its closest pose.
+
+    Reports on every image received on the topic — including ones the time
+    synchronizer will reject because the gap exceeds sync_slop. Note the
+    closest pose is searched among poses received *so far*; if odometry lags
+    the camera, the true closest pose may arrive slightly later.
+    """
+    stamp_ns = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
+    with self._pose_lock:
+      stamps = [t for t, _ in self._pose_buf]
+    self._rgb_stamp_cnt += 1
+    if len(stamps) == 0:
+      if self._rgb_stamp_cnt % self._sync_debug_log_period == 0:
+        logger.info("RGB->pose stamp diff: no poses received yet "
+                    "(%d images so far).", self._rgb_stamp_cnt)
+      return
+    diff_s = min(abs(t - stamp_ns) for t in stamps) / 1e9
+    self._rgb_pose_diffs.append(diff_s)
+    if self._rgb_stamp_cnt % self._sync_debug_log_period == 0:
+      d = self._rgb_pose_diffs
+      n_over = sum(1 for x in d if x > self._sync_slop)
+      logger.info(
+        "RGB->pose stamp diff (closest, last %d imgs): cur=%.3fs min=%.3fs "
+        "mean=%.3fs max=%.3fs | %d/%d exceed sync_slop=%.2fs",
+        len(d), d[-1], min(d), sum(d)/len(d), max(d),
+        n_over, len(d), self._sync_slop)
+      self._rgb_pose_diffs = []
 
   def _lookup_origin(self, stamp_ns):
     """Return (body position in world RDF, |dt| seconds) nearest to stamp_ns.

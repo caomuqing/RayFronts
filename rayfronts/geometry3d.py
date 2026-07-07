@@ -1240,6 +1240,27 @@ def add_weighted_binned_rays(rays1, feat_weight1, rays2, feat_weight2, vox_size,
   feat_weight[:, :-1] = feat_weight[:, :-1] / feat_weight[:, -1:]
   return rays, feat_weight
 
+def dilate_sparse_voxels(xyz_vx: torch.FloatTensor,
+                         vox_size: float,
+                         r: int = 1) -> torch.FloatTensor:
+  """Dilates a sparse voxel set by a cubic structuring element of radius r.
+
+  Args:
+    xyz_vx: Nx3 float tensor of voxel centers (voxelized at vox_size).
+    vox_size: Metric size of the voxel.
+    r: Structuring element radius in voxels; r=1 -> 3x3x3 (26-neighborhood).
+
+  Returns:
+    Mx3 float tensor of the dilated (deduplicated) voxel centers.
+  """
+  device = xyz_vx.device
+  o = torch.arange(-r, r+1, device=device, dtype=xyz_vx.dtype) * vox_size
+  offsets = torch.stack(torch.meshgrid(o, o, o, indexing="xy"),
+                        dim=-1).reshape(-1, 3)
+  dilated = (xyz_vx.reshape(-1, 1, 3) +
+             offsets.reshape(1, -1, 3)).reshape(-1, 3)
+  return pointcloud_to_sparse_voxels(dilated, vox_size)
+
 def intersect_voxels(xyz_vx1, xyz_vx2, vox_size):
   """Compute the set intersection between voxels
 
