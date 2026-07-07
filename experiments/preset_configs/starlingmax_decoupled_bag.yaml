@@ -44,6 +44,10 @@ dataset:
   # sync_slop governs the RGB<->pose match only (scans are decoupled).
   sync_queue_size: 150
   sync_slop: 0.1
+  # Bag-specific clock-domain correction: /drone/image_raw stamps are offset
+  # from /odom_px4_fused by ~12 days in this recording. Added to RGB stamps
+  # before time sync. Measured via the RGB->pose stamp diff log.
+  rgb_stamp_offset: -1052054.588
 
   intrinsics_file: ${calibration_dir}/intrinsics.txt
   extrinsics_conf_path: ${calibration_dir}/extrinsics.conf
