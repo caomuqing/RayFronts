@@ -137,6 +137,11 @@ class_frontier_min_cnt: 4
 # surface (removes points beneath e.g. the ground adjacent to its
 # unphotographable interior). Set to False for vertical classes like walls.
 class_frontier_top_surface_only: True
+# Top-surface mode: a boundary voxel covered by occupied voxels directly
+# above it is valid only if the consecutive occupied stack is at least this
+# many voxels tall (real structure); shorter covers are registered-scan
+# ground noise. Uncovered voxels are always valid. <= 1 disables.
+class_frontier_min_cover_height: 10
 
 # If > 0, prints mapper point/voxel stats every N processed batches.
 debug_log_period: 0

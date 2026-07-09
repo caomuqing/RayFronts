@@ -144,6 +144,7 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
                class_frontier_subsampling: int = 3,
                class_frontier_min_cnt: int = 4,
                class_frontier_top_surface_only: bool = True,
+               class_frontier_min_cover_height: int = 3,
                debug_log_period: int = 0):
     """
     Args:
@@ -246,6 +247,12 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
         interior of the ground). Right for horizontal-surface classes such as
         ground/floor; set to False for vertical classes such as walls where
         boundaries below the top edge are meaningful.
+      class_frontier_min_cover_height: In top-surface mode, a boundary voxel
+        covered by occupied voxels directly above it is valid only if the
+        consecutive occupied stack is at least this many voxels tall (real
+        structure rising from the surface); shorter covers are treated as
+        registered-scan ground noise. Uncovered voxels (nothing occupied
+        directly above) are always valid. Set to <= 1 to disable.
       debug_log_period: If > 0, print mapper point/voxel stats every N calls.
     """
     super().__init__(intrinsics_3x3, device, visualizer, clip_bbox, encoder,
@@ -296,12 +303,13 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     self.class_frontier_subsampling = int(class_frontier_subsampling)
     self.class_frontier_min_cnt = int(class_frontier_min_cnt)
     self.class_frontier_top_surface_only = bool(class_frontier_top_surface_only)
+    self.class_frontier_min_cover_height = int(class_frontier_min_cover_height)
     self._class_frontier_warned = False
     # TEMP(viz-only): height band (min, max) in metres for all voxel/frontier
     # visualization layers. Up = -y in world RDF, relative to world origin.
     # Set to None to visualize everything again. Does NOT affect the map,
     # queries, or messaging — display only.
-    self.vis_height_range = None
+    self.vis_height_range = (-10.0, 1.0)
     self.debug_log_period = int(debug_log_period)
     self._debug_frame_idx = 0
 
@@ -333,6 +341,8 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     # Kx3 clustered boundary points of the selected semantic classes.
     # See update_class_frontiers.
     self.class_frontiers = None
+    # Nx3 raw (pre-clustering) boundary voxels of the selected classes.
+    self.class_frontiers_raw = None
     # Nx3 voxel centers classified as one of class_frontier_classes at the
     # last update_class_frontiers call (used e.g. as exploration anchors).
     self.class_voxels_xyz = None
@@ -813,20 +823,23 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
       # Cluster with per-cell total and unlabeled counts: flag a cell only if
       # unlabeled voxels are numerous AND the dominant share, so partially
       # labeled surfaces (e.g. obliquely viewed ground) are not flagged
-      # wholesale.
+      # wholesale. The reported point is the mean position of the unlabeled
+      # member voxels (cluster-grid cell centers can float off the surface).
       feat = torch.cat(
-        [torch.ones_like(unlabeled_flag), unlabeled_flag], dim=-1)
-      clustered, cnts = g3d.pointcloud_to_sparse_voxels(
+        [torch.ones_like(unlabeled_flag), unlabeled_flag,
+         occ_cells * unlabeled_flag], dim=-1)
+      _, cnts = g3d.pointcloud_to_sparse_voxels(
         occ_cells, vox_size=self.vox_size*self.fronti_subsampling,
         feat_pc=feat, aggregation="sum")
       total = cnts[:, 0]
       unlabeled_cnt = cnts[:, 1]
+      centers = cnts[:, 2:5] / unlabeled_cnt.clamp(min=1).unsqueeze(-1)
       mask = ((unlabeled_cnt > self.fronti_subsampling_min_fronti) &
               (unlabeled_cnt / total.clamp(min=1) >=
                self.coverage_min_unlabeled_frac))
-      clustered = clustered[mask]
+      centers = centers[mask]
       self.semantic_coverage_frontiers = \
-        clustered if clustered.shape[0] > 0 else None
+        centers if centers.shape[0] > 0 else None
     else:
       self.semantic_coverage_frontiers = \
         occ_cells[unlabeled_flag.squeeze(-1) == 1]
@@ -859,6 +872,7 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     if (self.global_vox_xyz is None or self.global_vox_xyz.shape[0] == 0 or
         query_feats is None or len(query_labels) == 0):
       self.class_frontiers = None
+      self.class_frontiers_raw = None
       return
 
     targets = set(self.class_frontier_classes)
@@ -889,6 +903,7 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     self.class_voxels_xyz = cls_xyz if cls_xyz.shape[0] > 0 else None
     if cls_xyz.shape[0] == 0:
       self.class_frontiers = None
+      self.class_frontiers_raw = None
       return
 
     # Adjacency sets: (1) occupied-but-unlabeled, (2) raw frontier cells.
@@ -900,6 +915,7 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
       adj_sets.append(self._frontiers_raw.to(cls_xyz.device))
     if len(adj_sets) == 0:
       self.class_frontiers = None
+      self.class_frontiers_raw = None
       return
     adj = g3d.pointcloud_to_sparse_voxels(
       torch.cat(adj_sets, dim=0), self.vox_size)
@@ -924,6 +940,7 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     boundary = union[flag == 0]
     if boundary.shape[0] == 0:
       self.class_frontiers = None
+      self.class_frontiers_raw = None
       return
 
     if self.class_frontier_top_surface_only:
@@ -948,16 +965,52 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
                           (boundary[:, 1] <= top_y[pos] + 0.6*self.vox_size)]
       if boundary.shape[0] == 0:
         self.class_frontiers = None
+        self.class_frontiers_raw = None
         return
 
-    # Cluster boundary voxels into frontier points.
+      # Vertical cover filter: a boundary voxel covered by occupied voxels
+      # directly above it is valid only if the consecutive occupied stack is
+      # at least class_frontier_min_cover_height voxels tall (real structure
+      # rising from the surface, e.g. an unphotographed wall/object base);
+      # shorter covers (e.g. 1-2 voxels) are registered-scan ground noise.
+      # Uncovered voxels (nothing occupied directly above) are always valid.
+      k = self.class_frontier_min_cover_height
+      if k > 1:
+        occ_stack = []
+        for i in range(1, k + 1):
+          a = boundary.clone()
+          a[:, 1] -= i * self.vox_size  # i cells above (up = -y)
+          # Snap to the exact k*vox grid floats the map writers use (VDB
+          # world->index conversion is sensitive at cell borders).
+          a = torch.round(a / self.vox_size) * self.vox_size
+          occ_stack.append(rayfronts_cpp.query_occ(
+            self.occ_map_vdb, a.cpu()).reshape(-1).to(boundary.device) > 0)
+        covered = occ_stack[0]
+        full_stack = occ_stack[0]
+        for o in occ_stack[1:]:
+          full_stack = full_stack & o
+        boundary = boundary[~(covered & ~full_stack)]
+        if boundary.shape[0] == 0:
+          self.class_frontiers = None
+          self.class_frontiers_raw = None
+          return
+
+    # Keep the raw boundary voxels (visualized as their own layer).
+    self.class_frontiers_raw = boundary
+
+    # Cluster boundary voxels into frontier points. The reported point is the
+    # MEAN of the member voxels, not the cluster cell center: cell centers are
+    # quantized to the coarse cluster grid and can float up to half a cluster
+    # cell above/below the actual surface.
     if self.class_frontier_subsampling > 1:
-      feat = torch.ones_like(boundary[:, 0:1])
-      clustered, cnt = g3d.pointcloud_to_sparse_voxels(
+      feat = torch.cat([torch.ones_like(boundary[:, 0:1]), boundary], dim=-1)
+      _, agg = g3d.pointcloud_to_sparse_voxels(
         boundary, vox_size=self.vox_size*self.class_frontier_subsampling,
         feat_pc=feat, aggregation="sum")
-      clustered = clustered[cnt[:, 0] >= self.class_frontier_min_cnt]
-      self.class_frontiers = clustered if clustered.shape[0] > 0 else None
+      cnt = agg[:, 0]
+      centers = agg[:, 1:4] / cnt.clamp(min=1).unsqueeze(-1)
+      centers = centers[cnt >= self.class_frontier_min_cnt]
+      self.class_frontiers = centers if centers.shape[0] > 0 else None
     else:
       self.class_frontiers = boundary
 
@@ -1411,16 +1464,29 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
                                layer="semantic_coverage_frontiers")
 
     # Vis class-specific frontiers (boundary of the selected semantic classes
-    # against unlabeled/unknown space). Fixed magenta.
+    # against unlabeled/unknown space). Fixed cyan — distinct from the
+    # magenta-ish voxel_occ layer.
     if self.class_frontiers is not None and self.class_frontiers.shape[0] > 0:
       cf = self.class_frontiers
       m = self._vis_height_mask(cf)
       if m is not None:
         cf = cf[m]
       if cf.shape[0] > 0:
-        cf_rgb = torch.tensor([[0.85, 0.1, 0.9]], device=cf.device).expand(
+        cf_rgb = torch.tensor([[0.0, 0.85, 1.0]], device=cf.device).expand(
           cf.shape[0], 3)
         self.visualizer.log_pc(cf, cf_rgb, layer="class_frontiers")
+
+    # Vis the raw (pre-clustering) class boundary voxels in a dimmer teal.
+    if (self.class_frontiers_raw is not None and
+        self.class_frontiers_raw.shape[0] > 0):
+      cfr = self.class_frontiers_raw
+      m = self._vis_height_mask(cfr)
+      if m is not None:
+        cfr = cfr[m]
+      if cfr.shape[0] > 0:
+        cfr_rgb = torch.tensor([[0.0, 0.5, 0.6]], device=cfr.device).expand(
+          cfr.shape[0], 3)
+        self.visualizer.log_pc(cfr, cfr_rgb, layer="class_frontiers_raw")
 
     # Vis rays
     if (self.global_rays_orig_angles is not None and

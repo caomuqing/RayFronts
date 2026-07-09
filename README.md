@@ -148,7 +148,7 @@ rerun and queryable on the mapper):
 |---|---|
 | `frontiers` | geometric: observed-free bordering unobserved space |
 | `semantic_coverage_frontiers` (orange) | occupied but never photographed (LiDAR-mapped, camera-unseen) |
-| `class_frontiers` (magenta) | boundary of chosen semantic classes (`mapping.class_frontier_classes`, e.g. `["ground"]`) against unlabeled/unknown space |
+| `class_frontiers` (cyan) | boundary of chosen semantic classes (`mapping.class_frontier_classes`, e.g. `["ground"]`) against unlabeled/unknown space |
 
 ### Exploration planner
 
