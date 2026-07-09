@@ -56,6 +56,11 @@ class MappingServer:
     self.status = MappingServer.Status.INIT
     self._status_lock = threading.RLock()
 
+    # Guards mapper state (occupancy VDB + tensors) so external consumers
+    # (e.g. the exploration planner) can safely query the map from another
+    # thread. The mapping loops acquire it around map-mutating calls.
+    self.map_lock = threading.RLock()
+
     self.cfg = cfg
     self.dataset: datasets.PosedRgbdDataset = \
       hydra.utils.instantiate(cfg.dataset)
@@ -235,7 +240,7 @@ class MappingServer:
       self._queries_updated = False
 
   def run_queries(self):
-    with self._query_lock:
+    with self._query_lock, self.map_lock:
       if (self._queries_feats is not None and len(self._queries_feats) > 0):
         kwargs = dict()
         if self._query_cmap is not None and len(self._query_cmap) > 0:
@@ -344,7 +349,8 @@ class MappingServer:
 
       if item["type"] == "scan":
         t0 = time.time()
-        self.mapper.process_pointcloud(item["pc_xyz"], item["origin"])
+        with self.map_lock:
+          self.mapper.process_pointcloud(item["pc_xyz"], item["origin"])
         total_geo += time.time() - t0
         n_scans += 1
 
@@ -365,7 +371,8 @@ class MappingServer:
           n_kf += 1
           rgb_img = item["rgb_img"].unsqueeze(0)
           t0 = time.time()
-          r = self.mapper.process_semantic_frame(rgb_img, pose_4x4)
+          with self.map_lock:
+            r = self.mapper.process_semantic_frame(rgb_img, pose_4x4)
           sem_p = time.time() - t0
           total_sem += sem_p
 
@@ -474,7 +481,9 @@ class MappingServer:
             self.vis.log_label_img(batch["semseg_img"][-1])
 
       map_t0 = time.time()
-      r = self.mapper.process_posed_rgbd(rgb_img, depth_img, pose_4x4, **kwargs)
+      with self.map_lock:
+        r = self.mapper.process_posed_rgbd(rgb_img, depth_img, pose_4x4,
+                                           **kwargs)
       map_t1 = time.time()
 
       if self.vis is not None:

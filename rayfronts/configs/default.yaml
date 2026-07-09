@@ -27,6 +27,46 @@ decoupled_pipeline: False
 # synced RGB/pose frame.
 semantic_keyframe_period: 5
 
+# Exploration planner (python3 -m rayfronts.exploration_planner). Launching it
+# also launches the mapping process; the planner runs on a background thread.
+exploration:
+  # Frontier selection cost = distance_weight * distance
+  # + heading_weight * |heading change to face the frontier| (radians).
+  distance_weight: 1.0   # a
+  heading_weight: 1.0    # b
+  # Which mapper frontier tensor to explore: class_frontiers (default),
+  # frontiers (geometric), or semantic_coverage_frontiers.
+  frontier_source: class_frontiers
+  # Exploration pose: hover_height (h) metres above a selected-class voxel...
+  hover_height: 1.5
+  # ...with a fully known-empty sphere of safety_radius (r) around it
+  # (unobserved space counts as unsafe)...
+  safety_radius: 0.7
+  # ...within this horizontal standoff range of the frontier, with an
+  # occlusion-free line of sight to it.
+  view_min_dist: 0.8
+  view_max_dist: 6.0
+  # The frontier must sit within the camera's viewable elevation band:
+  # |depression angle - view_pitch_deg| <= view_max_elevation_deg, where
+  # view_pitch_deg is the camera pitch below the horizon (0 = level) and
+  # view_max_elevation_deg ~ half the vertical FOV. Set to null to derive it
+  # from the camera intrinsics (atan((H/2)/fy)). Note this implies a minimum
+  # standoff of hover_height / tan(pitch + max_elevation).
+  view_pitch_deg: 0.0
+  view_max_elevation_deg: null
+  # Only class voxels within this radius of the frontier are considered as
+  # anchor candidates.
+  candidate_search_radius: 6.0
+  # Cap on candidates checked per frontier and frontiers tried per cycle
+  # (failed frontiers are blacklisted/removed).
+  max_candidates: 128
+  max_attempts_per_cycle: 10
+  # Seconds between planning cycles.
+  plan_period: 2.0
+  # ROS output (PoseStamped) in the pose-topic world frame.
+  goal_topic: /rayfronts/exploration_goal
+  goal_frame_id: map
+
 # Imposing a depth limit on the data such that to test limited depth scenarios
 # Set to a negative number to not use a limit
 depth_limit: -1

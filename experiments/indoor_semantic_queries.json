@@ -3,5 +3,6 @@
   "chair": "#fc8d62",
   "wall": "#8da0cb",
   "table": "#66c2a5",
-  "ground": "#a6d854"
+  "ground": "#a6d854",
+  "beam": "#e5c494"
 }

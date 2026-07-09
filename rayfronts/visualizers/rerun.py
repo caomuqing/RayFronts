@@ -196,6 +196,41 @@ class RerunVis(Mapping3DVisualizer):
         scale=2)
       rr.log(f"{self._base_name}/{layer}/{i}", rr_transform)
 
+  def log_goal_pose(self,
+                    pose_4x4: torch.FloatTensor,
+                    target_xyz: torch.FloatTensor = None,
+                    layer: str = "exploration_goal") -> None:
+    """Logs a highly visible goal pose marker with its heading.
+
+    Draws a large sphere at the goal position, a thick 1m heading arrow along
+    the pose forward (+z) axis, and optionally a sight line to the target the
+    goal intends to observe (target drawn in yellow).
+
+    Safe to call from non-visualization threads: rerun timelines are
+    per-thread, so this method first syncs the calling thread's timeline to
+    the current step (logs from other threads would otherwise not appear at
+    the viewer's playhead).
+    """
+    _set_rerun_time("stable_time", self.time_step * 0.1)
+    pos = pose_4x4[:3, 3].detach().cpu().reshape(1, 3)
+    fwd = pose_4x4[:3, 2].detach().cpu().reshape(1, 3)
+    green = [0, 255, 128]
+    rr.log(f"{self._base_name}/{layer}/position",
+           rr.Points3D(positions=pos, colors=[green],
+                       radii=self.base_point_size * 4))
+    rr.log(f"{self._base_name}/{layer}/heading",
+           rr.Arrows3D(origins=pos, vectors=fwd * 1.0, colors=[green],
+                       radii=self.base_point_size))
+    if target_xyz is not None:
+      t = target_xyz.detach().cpu().reshape(1, 3)
+      rr.log(f"{self._base_name}/{layer}/target",
+             rr.Points3D(positions=t, colors=[[255, 220, 0]],
+                         radii=self.base_point_size * 3))
+      strip = torch.cat([pos, t], dim=0).numpy()
+      rr.log(f"{self._base_name}/{layer}/sight_line",
+             rr.LineStrips3D(strips=[strip], colors=[green],
+                             radii=self.base_point_size * 0.3))
+
   @override
   def step(self):
     super().step()

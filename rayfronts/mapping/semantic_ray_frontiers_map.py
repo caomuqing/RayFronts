@@ -333,6 +333,9 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     # Kx3 clustered boundary points of the selected semantic classes.
     # See update_class_frontiers.
     self.class_frontiers = None
+    # Nx3 voxel centers classified as one of class_frontier_classes at the
+    # last update_class_frontiers call (used e.g. as exploration anchors).
+    self.class_voxels_xyz = None
     # Raw (pre-subsampling) geometric frontier cells at vox_size resolution.
     # Maintained by update_frontiers; used for class-frontier adjacency.
     self._frontiers_raw = None
@@ -883,6 +886,7 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     if self.class_frontier_min_prob > 0:
       target_mask &= best_prob >= self.class_frontier_min_prob
     cls_xyz = self.global_vox_xyz[target_mask]
+    self.class_voxels_xyz = cls_xyz if cls_xyz.shape[0] > 0 else None
     if cls_xyz.shape[0] == 0:
       self.class_frontiers = None
       return
