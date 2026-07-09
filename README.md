@@ -117,6 +117,58 @@ To run the docker image, an example command is available at the top of each dock
     ```
 4. To add and visualize queries, setup a query file (named "prompts.txt" for e.g) and add a query at each line in the text file (You can add paths to images for image querying). Next, add the following command line options when running RayFronts `querying.text_query_mode=prompts querying.query_file=prompts.txt querying.compute_prob=True querying.period=100`. More information can be found about the querying options in the [default.yml](rayfronts/configs/default.yml) config file.
 
+## Decoupled LiDAR/Camera Mapping & Exploration
+
+For platforms where geometry comes from a LiDAR (e.g. a globally registered
+scan topic) and semantics from a separate camera, the decoupled pipeline
+builds the map as two independent processes instead of one RGB-D path:
+
+- **Geometry** (every scan): occupancy is built directly from the point cloud
+  with free space carved from the scan-time sensor origin
+  (`SemanticRayFrontiersMap.process_pointcloud`). Geometry never waits for
+  RGB/pose sync.
+- **Semantics** (every `semantic_keyframe_period`-th synced RGB frame):
+  encoder features are attached to *visible* occupied voxels using a
+  footprint-splat z-buffer occlusion test
+  (`SemanticRayFrontiersMap.process_semantic_frame`).
+
+Enable with `decoupled_pipeline: true` (server) and `dataset.decoupled_mode:
+true` (the dataset must yield tagged scan/frame items, see
+`StarlingMaxSubscriber`). A full example preset is provided:
+
+```
+ros2 bag play <bag> --loop
+python3 -m rayfronts.mapping_server --config-dir experiments/preset_configs --config-name starlingmax_decoupled_bag
+```
+
+The decoupled mapper maintains three frontier products (all visualized in
+rerun and queryable on the mapper):
+
+| Layer | Meaning |
+|---|---|
+| `frontiers` | geometric: observed-free bordering unobserved space |
+| `semantic_coverage_frontiers` (orange) | occupied but never photographed (LiDAR-mapped, camera-unseen) |
+| `class_frontiers` (magenta) | boundary of chosen semantic classes (`mapping.class_frontier_classes`, e.g. `["ground"]`) against unlabeled/unknown space |
+
+### Exploration planner
+
+`rayfronts/exploration_planner.py` runs frontier-driven exploration on top of
+the mapping server (launching it also launches mapping):
+
+```
+python3 -m rayfronts.exploration_planner --config-dir experiments/preset_configs --config-name starlingmax_decoupled_bag
+```
+
+Each cycle it ranks frontiers by `a*distance + b*heading_change`, then
+searches a safe observation pose: `hover_height` above a selected-class
+voxel, a fully known-empty sphere of `safety_radius` around it, the frontier
+within the camera's elevation band (derived from the intrinsics by default),
+and an occlusion-free line of sight. Frontiers with no valid pose are
+removed (blacklisted). The goal is drawn in rerun (`exploration_goal`, green
+sphere + heading arrow) and published as a `PoseStamped` on
+`exploration.goal_topic`. All parameters live under the `exploration`
+section of [default.yaml](rayfronts/configs/default.yaml).
+
 ## Running Image Encoding
 If you are interested in using the encoder on its own for zero-shot open-vocabulary semantic segmentation, follow the example at the top of the [NARADIO](rayfronts/image_encoders/naradio.py) module.
 Or run the provided GRADIO app by installing gradio `pip install gradio` then running:
