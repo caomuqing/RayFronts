@@ -37,9 +37,21 @@ dataset:
   depth_intrinsics_file: null
   point_cloud_topic: "/registered_scan"
   point_cloud_frame: "world"
+  # Calibrated with scripts/calibrate_scan_transform.py on
+  # rosbag2_ric_indoor_open (residual tilt 0.911deg, height -5.5cm of the
+  # previous hand-derived value). NOTE: the superodom_map frame depends on
+  # LiDAR-odometry initialization, so this is per-recording — re-run the
+  # calibration script when switching bags.
   point_cloud_to_world_transform:
-    [0.0, 0.0, 0.0, 0.1800308, -0.1800308, 0.6838047, -0.6838047]
+    [0.0024759, 0.0003681, 0.0158068, -0.1738514, 0.1754495, -0.6849878, 0.6854085] #calibrated on rosbag2_ric_indoor_open
+    #[0.0, 0.0, 0.0, 0.1800308, -0.1800308, 0.6838047, -0.6838047]
   decoupled_mode: true
+  # Map only within 10m of the scan origin: beyond that, registration error
+  # approaches voxel size and far ground flickers.
+  scan_max_range: -1
+  # Discard the rear cone (+-60deg around backward) of each scan: behind the
+  # camera, and already mapped when it was in front. Tune to taste.
+  scan_rear_discard_deg: 60.0
   confidence_topic: null
   # sync_slop governs the RGB<->pose match only (scans are decoupled).
   sync_queue_size: 150
@@ -66,7 +78,7 @@ mapping:
   occ_thickness: 2
   # Carving all ~20k rays per scan is heavy; subsample empty samples per scan.
   max_empty_pts_per_frame: 500000
-  # Boundary frontiers of these classes vs unlabeled/unknown space (magenta
+  # Boundary frontiers of these classes vs unlabeled/unknown space (cyan
   # "class_frontiers" layer). Must be labels from the query file.
   class_frontier_classes: ["ground"]
   debug_log_period: 10

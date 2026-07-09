@@ -54,6 +54,18 @@ decoupled_mode: false
 # queued during encoder warmup, or bag-loop wraps).
 origin_max_dt: 0.5
 
+# Decoupled mode only: drop scan points farther than this from the scan
+# origin (metres). Registration error grows with range, making far points
+# flicker across voxels and their carve rays cut mid-range surfaces; far
+# geometry is mapped once the robot gets closer. <= 0 disables.
+scan_max_range: -1.0
+
+# Decoupled mode only: discard scan points whose horizontal bearing from the
+# scan origin is within this half-angle (deg) of the robot's BACKWARD
+# direction at scan time (60 = a 120-deg rear cone). Rear geometry is behind
+# the camera and was already mapped when it was in front. <= 0 disables.
+scan_rear_discard_deg: 0.0
+
 # ---- Extrinsics (ModalAI extrinsics.conf) ----
 # Path to the ModalAI extrinsics.conf file that defines sensor mounting.
 # T_body_rgb and T_body_depth are derived automatically from this file.

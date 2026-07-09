@@ -503,6 +503,8 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
                point_cloud_accum_vox=0.1,
                decoupled_mode=False,
                origin_max_dt=0.5,
+               scan_max_range=-1.0,
+               scan_rear_discard_deg=0.0,
                rgb_frame_name="hires_front",
                depth_frame_name="tof",
                extrinsics_coord_system="frd",
@@ -569,6 +571,18 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
         in seconds for the carving-origin lookup; scans without a pose within
         this window are dropped (protects against stale queued scans and
         bag-loop wraps carving from a wrong origin).
+      scan_max_range: Decoupled mode only. Drop scan points farther than this
+        many metres from the scan origin before mapping (occupied marking AND
+        carving endpoints). Angular registration error displaces points
+        proportionally to range, so distant points flicker across voxels and
+        their carve rays cut through mid-range surfaces; far geometry is
+        mapped cleanly once the robot gets closer. Set <= 0 to disable.
+      scan_rear_discard_deg: Decoupled mode only. Discard scan points whose
+        horizontal bearing from the scan origin lies within this half-angle
+        (degrees) of the robot's BACKWARD direction at scan time (e.g. 60
+        discards a 120-degree rear cone). Rear geometry is behind the camera
+        (never labeled from this view) and was already mapped when it was in
+        front on a forward-flying platform. Set <= 0 to disable.
       rgb_frame_name: Child frame name for the RGB camera in the extrinsics
         file (default ``"hires_front"``).
       depth_frame_name: Child frame name for the depth sensor in the
@@ -692,6 +706,8 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     # (carving from a wrong origin corrupts occupancy).
     self._origin_max_dt = float(origin_max_dt)
     self._origin_skipped = 0
+    self._scan_max_range = float(scan_max_range)
+    self._scan_rear_discard_deg = float(scan_rear_discard_deg)
     self._point_cloud_debug_log_period = int(point_cloud_debug_log_period)
     self._shutdown_event = threading.Event()
     self.f = 0
@@ -999,10 +1015,29 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
       self._scan_queue.put(msg)
 
   def _cache_pose(self, msg):
-    """Ring-buffer every pose message for scan-time origin lookup."""
+    """Ring-buffer every pose message for scan-time origin lookup.
+
+    Also detects backward timestamp jumps (e.g. `ros2 bag play --loop`
+    wrapping): the ApproximateTimeSynchronizer evicts by MINIMUM stamp, so
+    after a wrap every new (smaller-stamped) message would be evicted on
+    arrival and RGB/pose would never match again. On a jump we flush the
+    synchronizer queues and the stale pose history. This runs on the same
+    executor thread as the synchronizer callbacks, so clearing is race-free,
+    and this callback is registered before the synchronizer's, so the flush
+    happens before the wrapped message is added.
+    """
     stamp_ns = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
-    pose_4x4 = _pose_msg_to_numpy(msg)
     with self._pose_lock:
+      if (len(self._pose_buf) > 0 and
+          stamp_ns < self._pose_buf[-1][0] - 5 * 10**9):
+        logger.warning(
+          "Backward stamp jump of %.1fs detected (bag loop wrap?); flushing "
+          "time-sync queues and pose buffer.",
+          (self._pose_buf[-1][0] - stamp_ns) / 1e9)
+        for q in self._time_sync.queues:
+          q.clear()
+        self._pose_buf.clear()
+      pose_4x4 = _pose_msg_to_numpy(msg)
       self._pose_buf.append((stamp_ns, pose_4x4))
 
   def _log_rgb_pose_stamp_diff(self, msg):
@@ -1035,7 +1070,8 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
       self._rgb_pose_diffs = []
 
   def _lookup_origin(self, stamp_ns):
-    """Return (body position in world RDF, |dt| seconds) nearest to stamp_ns.
+    """Return (body position, body forward dir, |dt| seconds), all in world
+    RDF, for the pose nearest to stamp_ns.
 
     Returns None if no poses have been received yet.
     """
@@ -1047,7 +1083,8 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     i = diffs.index(min(diffs))
     body_4x4 = torch.tensor(buf[i][1], dtype=torch.float)
     body_rdf = g3d.transform_pose_4x4(body_4x4, self.src2rdf)
-    return body_rdf[:3, 3].clone(), diffs[i] / 1e9
+    return (body_rdf[:3, 3].clone(), body_rdf[:3, 2].clone(),
+            diffs[i] / 1e9)
 
   def _scan_msg_to_item(self, msg):
     """Convert a PointCloud2 into a decoupled-mode scan item (or None).
@@ -1060,7 +1097,7 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     r = self._lookup_origin(stamp_ns)
     if r is None:
       return None  # No pose received yet.
-    origin, dt = r
+    origin, fwd, dt = r
     if dt > self._origin_max_dt:
       self._origin_skipped += 1
       if self._origin_skipped == 1 or self._origin_skipped % 50 == 0:
@@ -1072,6 +1109,30 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     xyz_world, _, _ = self._scan_to_world_points(msg, None, None)
     if xyz_world is None:
       return None
+    if self._scan_max_range > 0:
+      # Range-limit around the scan origin: distant points carry amplified
+      # registration error (error ~ angle * range) and destabilize the map.
+      xyz_world = xyz_world[
+        (xyz_world - origin.reshape(1, 3)).norm(dim=-1)
+        <= self._scan_max_range]
+      if xyz_world.shape[0] == 0:
+        return None
+    if self._scan_rear_discard_deg > 0:
+      # Discard points in the rear cone: horizontal bearing within the
+      # half-angle of the BACKWARD direction at scan time. Rear geometry is
+      # behind the camera and was already mapped when it was in front.
+      v = xyz_world - origin.reshape(1, 3)
+      vh = torch.stack([v[:, 0], v[:, 2]], dim=-1)  # horizontal (x, z)
+      fh = torch.tensor([fwd[0], fwd[2]], dtype=vh.dtype, device=vh.device)
+      fn = float(fh.norm())
+      if fn > 1e-6:  # skip if heading is degenerate (straight up/down)
+        vn = vh.norm(dim=-1)
+        cos_back = -(vh @ fh) / (vn.clamp(min=1e-9) * fn)
+        cos_half = float(np.cos(np.radians(self._scan_rear_discard_deg)))
+        in_rear = (vn > 1e-6) & (cos_back > cos_half)
+        xyz_world = xyz_world[~in_rear]
+        if xyz_world.shape[0] == 0:
+          return None
     return dict(type="scan", pc_xyz=xyz_world, origin=origin)
 
   def _scan_to_world_points(self, pc_msg, pose_depth, body_rdf):
@@ -1114,8 +1175,10 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     then at most one synced RGB/pose frame is yielded per round.
     """
     while True:
-      # Drain pending scans.
-      while True:
+      # Drain pending scans, but bounded per round: if scan processing is
+      # slower than scan arrival (e.g. running on CPU), an unbounded drain
+      # would starve RGB/pose frames forever.
+      for _ in range(4):
         try:
           scan_msg = self._scan_queue.get_nowait()
         except queue.Empty:

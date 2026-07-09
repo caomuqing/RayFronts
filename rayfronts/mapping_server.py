@@ -353,6 +353,12 @@ class MappingServer:
           self.mapper.process_pointcloud(item["pc_xyz"], item["origin"])
         total_geo += time.time() - t0
         n_scans += 1
+        # Also tick map vis on scans so geometry progress is visible even
+        # when no RGB/pose frames are flowing (sync issues, slow encoder).
+        if (self.vis is not None and self.cfg.vis.map_period > 0
+            and n_scans % self.cfg.vis.map_period == 0):
+          self.mapper.vis_map()
+          self.vis.step()
 
       elif item["type"] == "frame":
         n_frames += 1
