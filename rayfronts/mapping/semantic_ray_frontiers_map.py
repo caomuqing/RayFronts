@@ -17,6 +17,7 @@ Typical usage example:
 """
 
 from typing_extensions import override, List, Tuple, Dict
+from collections import deque
 import sys
 import os
 import math
@@ -346,6 +347,16 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     # Nx3 voxel centers classified as one of class_frontier_classes at the
     # last update_class_frontiers call (used e.g. as exploration anchors).
     self.class_voxels_xyz = None
+    # Ring buffer of (seq, Nx3 visible occupied voxel centers) per keyframe,
+    # appended by process_semantic_frame for external consumers (e.g. the
+    # exploration planner's 2D info grid).
+    self.keyframe_visible = deque(maxlen=8)
+    self._kf_seq = 0
+    # Query features/labels stored at the last update_class_frontiers call,
+    # so voxels can be (re)classified outside the query cadence.
+    self._last_query_feats = None
+    self._last_query_labels = None
+    self._last_query_compressed = False
     # Raw (pre-subsampling) geometric frontier cells at vox_size resolution.
     # Maintained by update_frontiers; used for class-frontier adjacency.
     self._frontiers_raw = None
@@ -756,6 +767,11 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     vis_vox = cand_f[visible]
     pix_flat = (v[visible] * rW + u[visible])
 
+    # Keyframe snapshot of the visible occupied voxels for external
+    # consumers (e.g. the exploration planner's 2D info grid).
+    self._kf_seq += 1
+    self.keyframe_visible.append((self._kf_seq, vis_vox.detach().clone()))
+
     # Encode features and sample at the projected pixels (same path as
     # process_posed_rgbd).
     feat_img = self.encoder.encode_image_to_feat_map(rgb_img)
@@ -790,6 +806,39 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
         0 if cov is None else cov.shape[0])
 
     return update_info
+
+  def get_class_partition(self):
+    """Splits labeled voxels into chosen-class vs other-class sets.
+
+    Classifies all semantic voxels by argmax over the query set stored at the
+    last update_class_frontiers call, against class_frontier_classes (with
+    the class_frontier_min_prob gate).
+
+    Returns:
+      (chosen_xyz, other_xyz) float tensors, or None when classification is
+      not available yet (no query features / no labeled voxels / no classes).
+    """
+    if (self._last_query_feats is None or
+        len(self.class_frontier_classes) == 0 or
+        self.global_vox_xyz is None or self.global_vox_xyz.shape[0] == 0):
+      return None
+    targets = set(self.class_frontier_classes)
+    target_idx = [i for i, l in enumerate(self._last_query_labels)
+                  if l in targets]
+    if len(target_idx) == 0:
+      return None
+    vox_feat = self.global_vox_feat
+    if self.feat_compressor is not None and not self._last_query_compressed:
+      vox_feat = self.feat_compressor.decompress(vox_feat)
+    vox_feat = self.encoder.align_spatial_features_with_language(
+      vox_feat.unsqueeze(-1).unsqueeze(-1)).squeeze(-1).squeeze(-1)
+    prob = compute_cos_sim(self._last_query_feats, vox_feat, softmax=True)
+    best_prob, best_cls = prob.max(dim=-1)
+    mask = torch.isin(
+      best_cls, torch.tensor(target_idx, device=best_cls.device))
+    if self.class_frontier_min_prob > 0:
+      mask &= best_prob >= self.class_frontier_min_prob
+    return self.global_vox_xyz[mask], self.global_vox_xyz[~mask]
 
   def update_semantic_coverage_frontiers(
       self, occupied_centers: torch.FloatTensor) -> None:
@@ -869,6 +918,12 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     """
     if len(self.class_frontier_classes) == 0:
       return
+    if query_feats is not None and len(query_labels) > 0:
+      # Keep the query set so voxels can be (re)classified outside the query
+      # cadence (see get_class_partition).
+      self._last_query_feats = query_feats.detach()
+      self._last_query_labels = list(query_labels)
+      self._last_query_compressed = bool(compressed)
     if (self.global_vox_xyz is None or self.global_vox_xyz.shape[0] == 0 or
         query_feats is None or len(query_labels) == 0):
       self.class_frontiers = None

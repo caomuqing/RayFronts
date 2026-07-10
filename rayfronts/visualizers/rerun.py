@@ -196,6 +196,15 @@ class RerunVis(Mapping3DVisualizer):
         scale=2)
       rr.log(f"{self._base_name}/{layer}/{i}", rr_transform)
 
+  def sync_thread_time(self) -> None:
+    """Syncs the calling thread's rerun timeline to the current step.
+
+    Rerun timelines are per-thread: logs from non-visualization threads (e.g.
+    the exploration planner) would otherwise not appear at the viewer's
+    playhead. Call before logging from such threads.
+    """
+    _set_rerun_time("stable_time", self.time_step * 0.1)
+
   def log_goal_pose(self,
                     pose_4x4: torch.FloatTensor,
                     target_xyz: torch.FloatTensor = None,
@@ -211,7 +220,7 @@ class RerunVis(Mapping3DVisualizer):
     the current step (logs from other threads would otherwise not appear at
     the viewer's playhead).
     """
-    _set_rerun_time("stable_time", self.time_step * 0.1)
+    self.sync_thread_time()
     pos = pose_4x4[:3, 3].detach().cpu().reshape(1, 3)
     fwd = pose_4x4[:3, 2].detach().cpu().reshape(1, 3)
     green = [0, 255, 128]

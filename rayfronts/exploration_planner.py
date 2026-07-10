@@ -102,6 +102,19 @@ class ExplorationPlanner:
     self.max_candidates = int(cfg.max_candidates)
 
     self.vox_size = float(self.mapper.vox_size)
+
+    # 2D information grid: dict {(ix, iz): [state, confidence, y, gnd_votes,
+    # obs_votes]} over the horizontal world plane (cell centers at
+    # ix*grid_cell_size, iz*grid_cell_size). Cells accumulate per-voxel votes
+    # across keyframes; state is 2 = obstacle iff obs/(obs+gnd) >=
+    # obstacle_min_frac (with at least one obstacle vote), else 1 =
+    # non-obstacle; unknown cells are absent. Confidence is the winning
+    # state's vote fraction. y is display-only.
+    self.info_grid = {}
+    self.grid_cell_size = float(cfg.grid_cell_size)
+    self.obstacle_max_height_voxels = int(cfg.obstacle_max_height_voxels)
+    self.obstacle_min_frac = float(cfg.obstacle_min_frac)
+    self._grid_last_seq = 0
     # Blacklist keys are rounded to the frontier cluster grid so recomputed
     # frontiers at the same location stay removed.
     self._bl_grid = self.vox_size * float(
@@ -157,8 +170,17 @@ class ExplorationPlanner:
   def shutdown(self):
     self._stop.set()
 
+  @torch.inference_mode()
   def _loop(self):
+    # inference_mode is thread-local: the mapper's tensors are inference
+    # tensors (created under the mapping thread's inference mode), and
+    # running encoder modules on them from this thread without it would
+    # attempt to record autograd state and fail.
     while not self._stop.is_set():
+      try:
+        self._update_info_grid()
+      except Exception:
+        logger.exception("Info grid update failed.")
       try:
         self._plan_once()
       except Exception:  # Keep planning alive; mapping owns the process.
@@ -293,6 +315,173 @@ class ExplorationPlanner:
     T[:3, 2] = fwd
     T[:3, 3] = pos
     return T
+
+  # ---------- 2D information grid ----------
+
+  @staticmethod
+  def _cell_hash(xyz, res):
+    """Full 3D voxel-cell hash at resolution res."""
+    c = torch.round(xyz / res).long()
+    m = 2 ** 20
+    return (c[:, 0] * m + c[:, 1]) * m + c[:, 2]
+
+  @staticmethod
+  def _col_hash(xyz, res):
+    """Lateral (x, z) column hash at resolution res."""
+    c = torch.round(xyz[:, [0, 2]] / res).long()
+    return c[:, 0] * (2 ** 20) + c[:, 1]
+
+  @staticmethod
+  def _member(query_h, sorted_h):
+    """Per-row membership of query hashes in a sorted hash tensor."""
+    if sorted_h.shape[0] == 0:
+      return torch.zeros(query_h.shape[0], dtype=torch.bool)
+    p = torch.searchsorted(sorted_h, query_h).clamp(max=sorted_h.shape[0] - 1)
+    return sorted_h[p] == query_h
+
+  def _update_info_grid(self):
+    """Updates the 2D info grid from new keyframe visible-voxel snapshots.
+
+    Per keyframe: chosen-class visible voxels with no other-class voxel
+    beneath them (same lateral voxel column, checked against the GLOBAL
+    labeled map) mark their cell non-obstacle; other-class visible voxels
+    within obstacle_max_height_voxels above a chosen-class voxel in their
+    column mark their cell obstacle. Obstacle wins cell conflicts.
+    """
+    with self.server.map_lock:
+      snaps = [(s, v.detach().cpu().clone())
+               for s, v in self.mapper.keyframe_visible
+               if s > self._grid_last_seq]
+      part = self.mapper.get_class_partition() if snaps else None
+      if part is not None:
+        chosen = part[0].detach().cpu().clone()
+        other = part[1].detach().cpu().clone()
+    if not snaps or part is None or chosen.shape[0] == 0:
+      return
+
+    vox = self.vox_size
+    # Global per-column structures (up = -y):
+    # - highest chosen voxel per column (min y)
+    # - deepest other voxel per column (max y): any other BELOW a voxel v in
+    #   the column exists iff this deepest y > y_v.
+    ch_col = self._col_hash(chosen, vox)
+    ch_u, ch_inv = torch.unique(ch_col, return_inverse=True)
+    ch_top = torch.full((ch_u.shape[0],), torch.inf)
+    ch_top.scatter_reduce_(0, ch_inv, chosen[:, 1], reduce="amin",
+                           include_self=False)
+    ot_deep_u = torch.empty(0, dtype=torch.long)
+    ot_deep = torch.empty(0)
+    if other.shape[0] > 0:
+      ot_col = self._col_hash(other, vox)
+      ot_deep_u, ot_inv = torch.unique(ot_col, return_inverse=True)
+      ot_deep = torch.full((ot_deep_u.shape[0],), -torch.inf)
+      ot_deep.scatter_reduce_(0, ot_inv, other[:, 1], reduce="amax",
+                              include_self=False)
+
+    ch_set = torch.sort(self._cell_hash(chosen, vox)).values
+    ot_set = torch.sort(self._cell_hash(other, vox)).values \
+      if other.shape[0] > 0 else torch.empty(0, dtype=torch.long)
+
+    g = self.grid_cell_size
+    n_h = self.obstacle_max_height_voxels * vox
+    for seq, vis in snaps:
+      self._grid_last_seq = max(self._grid_last_seq, seq)
+      if vis.shape[0] == 0:
+        continue
+      vis_h = self._cell_hash(vis, vox)
+      is_chosen = self._member(vis_h, ch_set)
+      is_other = self._member(vis_h, ot_set) & ~is_chosen
+
+      # Non-obstacle: chosen visible voxels with NO other-class beneath.
+      vc = vis[is_chosen]
+      if vc.shape[0] > 0:
+        col = self._col_hash(vc, vox)
+        has_other_below = torch.zeros(vc.shape[0], dtype=torch.bool)
+        if ot_deep_u.shape[0] > 0:
+          p = torch.searchsorted(ot_deep_u, col).clamp(
+            max=ot_deep_u.shape[0] - 1)
+          found = ot_deep_u[p] == col
+          has_other_below = found & (ot_deep[p] > vc[:, 1] + 0.5 * vox)
+        self._mark_cells(vc[~has_other_below], 1, g)
+
+      # Obstacle: other visible voxels within n voxels above a chosen voxel
+      # of the same column (chosen top strictly below the voxel).
+      vo = vis[is_other]
+      if vo.shape[0] > 0:
+        col = self._col_hash(vo, vox)
+        p = torch.searchsorted(ch_u, col).clamp(max=ch_u.shape[0] - 1)
+        found = ch_u[p] == col
+        top = ch_top[p]
+        near_ground = (found & (top > vo[:, 1] + 0.5 * vox) &
+                       (top - vo[:, 1] <= n_h + 1e-6))
+        # Obstacle cells are displayed at their column's ground height so the
+        # grid renders as a flat 2D map draped on the floor (the grid itself
+        # is 2D; y is visualization-only).
+        self._mark_cells(vo[near_ground], 2, g, y_vals=top[near_ground])
+
+    self._vis_info_grid()
+
+  def _mark_cells(self, pts, state, cell_size, y_vals=None):
+    """Adds one vote per voxel to its cell and refreshes the cell state.
+
+    Cells accumulate ground/obstacle vote counts across voxels and
+    keyframes. State becomes obstacle iff there is at least one obstacle
+    vote AND obs/(obs+gnd) >= obstacle_min_frac, else non-obstacle.
+    Confidence is the winning state's vote fraction. y_vals optionally
+    overrides the stored display height per point (display only).
+    """
+    if pts.shape[0] == 0:
+      return
+    ix = torch.round(pts[:, 0] / cell_size).long()
+    iz = torch.round(pts[:, 2] / cell_size).long()
+    ys = pts[:, 1] if y_vals is None else y_vals
+    for k in range(pts.shape[0]):
+      key = (int(ix[k]), int(iz[k]))
+      cell = self.info_grid.get(key)
+      if cell is None:
+        cell = [0, 0.0, float(ys[k]), 0, 0]  # state, conf, y, gnd, obs
+        self.info_grid[key] = cell
+      if state == 2:
+        cell[4] += 1
+      else:
+        cell[3] += 1
+      cell[2] = float(ys[k])
+      frac_obs = cell[4] / (cell[3] + cell[4])
+      if cell[4] > 0 and frac_obs >= self.obstacle_min_frac:
+        cell[0] = 2
+        cell[1] = frac_obs
+      else:
+        cell[0] = 1
+        cell[1] = 1.0 - frac_obs
+
+  def _vis_info_grid(self):
+    vis = getattr(self.server, "vis", None)
+    if vis is None or len(self.info_grid) == 0:
+      return
+    try:
+      g = self.grid_cell_size
+      keys = list(self.info_grid.keys())
+      vals = [self.info_grid[k] for k in keys]
+      # Render the whole layer on ONE flat plane: per-cell heights inherit
+      # classification noise (e.g. furniture voxels misclassified as ground
+      # lift their column's "ground top"), which made cells float. Plane
+      # height = configured grid_vis_height, else the median stored ground
+      # height across cells.
+      y_plane = self.cfg.get("grid_vis_height", None)
+      if y_plane is None:
+        ys = torch.tensor([v[2] for v in vals], dtype=torch.float)
+        y_plane = float(ys.median())
+      pts = torch.tensor([[k[0] * g, y_plane, k[1] * g]
+                          for k in keys], dtype=torch.float)
+      colors = torch.tensor([[0.2, 0.85, 0.3] if v[0] == 1
+                             else [0.95, 0.2, 0.15] for v in vals],
+                            dtype=torch.float)
+      if hasattr(vis, "sync_thread_time"):
+        vis.sync_thread_time()
+      radii = torch.full((pts.shape[0],), g * 0.45)
+      vis.log_pc(pts, colors, radii, layer="exploration/info_grid")
+    except Exception:
+      logger.exception("Failed to visualize info grid.")
 
   # ---------- planning cycle ----------
 
