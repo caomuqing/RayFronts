@@ -71,7 +71,7 @@ exploration:
   # other-class voxel beneath them (global-map check) mark non-obstacle;
   # other-class voxels within obstacle_max_height_voxels above a chosen-class
   # voxel mark obstacle. Obstacle wins cell conflicts.
-  grid_cell_size: 0.8
+  grid_cell_size: 0.2
   obstacle_max_height_voxels: 10
   # A cell is an obstacle iff it has at least one obstacle vote AND
   # obstacle_votes / total_votes >= obstacle_min_frac (votes are per voxel,
@@ -79,10 +79,19 @@ exploration:
   # 0.0 = a single obstacle vote dominates (maximally conservative); raise
   # (e.g. 0.2-0.4) so isolated misclassified voxels cannot poison a cell —
   # mainly useful when grid_cell_size > vox_size.
-  obstacle_min_frac: 0.5
+  obstacle_min_frac: 0.0
   # Height (world RDF y) at which the info grid layer is rendered in rerun.
   # null = median stored ground height across cells. Display only.
   grid_vis_height: null
+  # Exploration xy bounds, in the POSE-TOPIC world frame (e.g. PX4 NED map:
+  # x north-ish, y east-ish — the same frame goals are published in). Outside
+  # [xmin, xmax] x [ymin, ymax]: class-specific frontiers are not generated
+  # and the 2D info grid takes no votes. null = unbounded. Applied when
+  # running the exploration planner entry point.
+  xmin: null
+  xmax: null
+  ymin: null
+  ymax: null
 
 # Imposing a depth limit on the data such that to test limited depth scenarios
 # Set to a negative number to not use a limit

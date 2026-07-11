@@ -115,6 +115,16 @@ class ExplorationPlanner:
     self.obstacle_max_height_voxels = int(cfg.obstacle_max_height_voxels)
     self.obstacle_min_frac = float(cfg.obstacle_min_frac)
     self._grid_last_seq = 0
+
+    # Exploration xy bounds (pose-topic world frame) -> world-RDF AABB.
+    # Restricts class-frontier generation (installed on the mapper) and the
+    # info grid votes. None = unbounded.
+    self.bounds_rdf = self._compute_bounds_rdf(cfg)
+    if self.bounds_rdf is not None:
+      self.mapper.class_frontier_bounds = self.bounds_rdf
+      logger.info(
+        "Exploration bounds active: x [%s, %s], y [%s, %s] (pose frame).",
+        cfg.xmin, cfg.xmax, cfg.ymin, cfg.ymax)
     # Blacklist keys are rounded to the frontier cluster grid so recomputed
     # frontiers at the same location stay removed.
     self._bl_grid = self.vox_size * float(
@@ -156,6 +166,47 @@ class ExplorationPlanner:
       return None
     fy = float(K[1, 1])
     return math.degrees(math.atan2(h / 2.0, fy))
+
+  def _compute_bounds_rdf(self, cfg):
+    """Converts pose-frame xy bounds into a world-RDF (min, max) AABB.
+
+    Bounds are axis-aligned in the pose-topic world frame (e.g. PX4 NED);
+    the src->RDF conversion is a pure axis permutation, so the box stays
+    axis-aligned. The vertical axis is left unbounded. Returns None when no
+    bound is set.
+    """
+    vals = [cfg.get("xmin", None), cfg.get("xmax", None),
+            cfg.get("ymin", None), cfg.get("ymax", None)]
+    if all(v is None for v in vals):
+      return None
+    big = 1e6
+    xmin = float(vals[0]) if vals[0] is not None else -big
+    xmax = float(vals[1]) if vals[1] is not None else big
+    ymin = float(vals[2]) if vals[2] is not None else -big
+    ymax = float(vals[3]) if vals[3] is not None else big
+
+    ds = getattr(self.server, "dataset", None)
+    if ds is not None and hasattr(ds, "src2rdf"):
+      R = ds.src2rdf[:3, :3]
+    else:
+      logger.warning("Exploration bounds: no dataset src2rdf available; "
+                     "assuming bounds are already in world RDF.")
+      R = torch.eye(3)
+    # Transform the 8 corners (z unbounded) and take the axis-aligned hull.
+    corners = torch.tensor(
+      [[x, y, z] for x in (xmin, xmax) for y in (ymin, ymax)
+       for z in (-big, big)], dtype=torch.float)
+    corners = corners @ R.T
+    return corners.min(dim=0).values, corners.max(dim=0).values
+
+  def _in_bounds_mask(self, pts):
+    """Boolean mask of points inside the RDF bounds (all True if unbounded)."""
+    if self.bounds_rdf is None:
+      return torch.ones(pts.shape[0], dtype=torch.bool, device=pts.device)
+    mn, mx = self.bounds_rdf
+    mn = mn.to(pts.device).reshape(1, 3)
+    mx = mx.to(pts.device).reshape(1, 3)
+    return ((pts >= mn) & (pts <= mx)).all(dim=-1)
 
   # ---------- lifecycle ----------
 
@@ -386,6 +437,8 @@ class ExplorationPlanner:
     n_h = self.obstacle_max_height_voxels * vox
     for seq, vis in snaps:
       self._grid_last_seq = max(self._grid_last_seq, seq)
+      # Only voxels inside the exploration bounds vote.
+      vis = vis[self._in_bounds_mask(vis)]
       if vis.shape[0] == 0:
         continue
       vis_h = self._cell_hash(vis, vox)

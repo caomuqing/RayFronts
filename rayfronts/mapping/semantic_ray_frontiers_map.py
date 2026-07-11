@@ -344,6 +344,10 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     self.class_frontiers = None
     # Nx3 raw (pre-clustering) boundary voxels of the selected classes.
     self.class_frontiers_raw = None
+    # Optional (min_xyz, max_xyz) world-RDF AABB restricting class-frontier
+    # GENERATION (boundary voxels outside are dropped). Set externally, e.g.
+    # by the exploration planner from its xy bounds. None = unbounded.
+    self.class_frontier_bounds = None
     # Nx3 voxel centers classified as one of class_frontier_classes at the
     # last update_class_frontiers call (used e.g. as exploration anchors).
     self.class_voxels_xyz = None
@@ -1049,6 +1053,17 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
           self.class_frontiers = None
           self.class_frontiers_raw = None
           return
+
+    # Restrict generation to the exploration bounds if set (world-RDF AABB).
+    if self.class_frontier_bounds is not None:
+      mn, mx = self.class_frontier_bounds
+      mn = mn.to(boundary.device).reshape(1, 3)
+      mx = mx.to(boundary.device).reshape(1, 3)
+      boundary = boundary[((boundary >= mn) & (boundary <= mx)).all(dim=-1)]
+      if boundary.shape[0] == 0:
+        self.class_frontiers = None
+        self.class_frontiers_raw = None
+        return
 
     # Keep the raw boundary voxels (visualized as their own layer).
     self.class_frontiers_raw = boundary

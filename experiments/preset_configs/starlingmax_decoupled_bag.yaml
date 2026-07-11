@@ -104,3 +104,7 @@ exploration:
   # (e.g. 0.2-0.4) so isolated misclassified voxels cannot poison a cell —
   # mainly useful when grid_cell_size > vox_size.
   obstacle_min_frac: 0.5
+  xmin: -10
+  xmax: 10
+  ymin: -10
+  ymax: 10
