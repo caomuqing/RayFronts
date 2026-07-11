@@ -63,9 +63,17 @@ exploration:
   max_attempts_per_cycle: 10
   # Seconds between planning cycles.
   plan_period: 2.0
-  # ROS output (PoseStamped) in the pose-topic world frame.
-  goal_topic: /rayfronts/exploration_goal
-  goal_frame_id: map
+  # Goal output: bare geometry_msgs/Pose in the pose-topic world frame
+  # (PX4 NED map — same frame as the odometry topic).
+  goal_topic: /goal_point
+  # Goal feedback (std_msgs/Int8: 0 = in_progress, 1 = reached, 2 = failed).
+  # A new goal is published only when the outstanding one is reported
+  # reached or failed; status messages received earlier than
+  # status_min_delay seconds after the goal was published are ignored as
+  # stale feedback about the previous goal. A FAILED goal blacklists its
+  # frontier.
+  goal_status_topic: /goal_reach_status
+  status_min_delay: 0.3
   # 2D information grid (unknown / non-obstacle / obstacle + confidence),
   # built per keyframe from the visible voxels: chosen-class voxels with no
   # other-class voxel beneath them (global-map check) mark non-obstacle;

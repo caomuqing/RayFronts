@@ -165,9 +165,15 @@ voxel, a fully known-empty sphere of `safety_radius` around it, the frontier
 within the camera's elevation band (derived from the intrinsics by default),
 and an occlusion-free line of sight. Frontiers with no valid pose are
 removed (blacklisted). The goal is drawn in rerun (`exploration_goal`, green
-sphere + heading arrow) and published as a `PoseStamped` on
-`exploration.goal_topic`. All parameters live under the `exploration`
-section of [default.yaml](rayfronts/configs/default.yaml).
+sphere + heading arrow) and published as a bare `geometry_msgs/Pose` in the
+pose-topic (NED) world frame on `exploration.goal_topic` (default
+`/goal_point`). Publishing is feedback-driven: the planner subscribes to
+`exploration.goal_status_topic` (default `/goal_reach_status`,
+`std_msgs/Int8`: 0 in_progress, 1 reached, 2 failed) and selects a new goal
+only when the outstanding one is reached or failed (a failed goal's frontier
+is blacklisted); statuses received within `status_min_delay` (0.3s) of the
+goal publish are ignored as stale. All parameters live under the
+`exploration` section of [default.yaml](rayfronts/configs/default.yaml).
 
 ## Running Image Encoding
 If you are interested in using the encoder on its own for zero-shot open-vocabulary semantic segmentation, follow the example at the top of the [NARADIO](rayfronts/image_encoders/naradio.py) module.

@@ -18,8 +18,13 @@ Behaviour (per planning cycle):
   4. If no such pose exists the frontier is blacklisted (removed from future
      consideration) and the next-best frontier is tried.
 
-The selected goal is visualized (rerun) and published as a PoseStamped on
-goal_topic when ROS is available.
+The selected goal is visualized (rerun) and published as a bare
+geometry_msgs/Pose in the pose-topic (NED) world frame on goal_topic. Goal
+publishing is feedback-driven: a new goal is selected only after the
+outstanding one is reported reached or failed on goal_status_topic
+(std_msgs/Int8: 0 in_progress, 1 reached, 2 failed); status messages
+received earlier than status_min_delay seconds after the goal was published
+are ignored as stale feedback about the previous goal.
 """
 
 import logging
@@ -39,12 +44,18 @@ from rayfronts.mapping_server import MappingServer, signal_handler
 from rayfronts.mapping.semantic_ray_frontiers_map import rayfronts_cpp
 
 try:
-  from geometry_msgs.msg import PoseStamped
+  from geometry_msgs.msg import Pose
+  from std_msgs.msg import Int8
   from scipy.spatial.transform import Rotation
 except ModuleNotFoundError:
-  PoseStamped = None
+  Pose = None
 
 logger = logging.getLogger(__name__)
+
+# /goal_reach_status convention (std_msgs/Int8):
+GOAL_IN_PROGRESS = 0
+GOAL_REACHED = 1
+GOAL_FAILED = 2
 
 
 def _wrap_angle(a):
@@ -144,14 +155,30 @@ class ExplorationPlanner:
     self._thread = threading.Thread(
       target=self._loop, name="rayfronts_exploration_planner", daemon=True)
 
-    # Optional ROS goal publisher on the dataset's node.
+    # Goal output / feedback: the goal is published as a bare
+    # geometry_msgs/Pose in the pose-topic (NED) frame on goal_topic. A new
+    # goal is published only when the previous one is reported reached or
+    # failed on goal_status_topic (std_msgs/Int8: 0 in_progress, 1 reached,
+    # 2 failed), ignoring statuses received earlier than status_min_delay
+    # seconds after the goal was published (stale feedback for the previous
+    # goal). Without ROS, the planner falls back to replanning every cycle.
+    self.status_min_delay = float(cfg.get("status_min_delay", 0.3))
+    self._status_lock = threading.Lock()
+    self._latest_status = None      # (value, reception wall-time)
+    self._last_goal_pub_time = None  # wall-time of the outstanding goal
+    self._last_goal_key = None       # blacklist key of the outstanding goal
     self._goal_pub = None
     ds = getattr(server, "dataset", None)
-    if (PoseStamped is not None and ds is not None
+    if (Pose is not None and ds is not None
         and getattr(ds, "_rosnode", None) is not None):
       self._goal_pub = ds._rosnode.create_publisher(
-        PoseStamped, str(cfg.goal_topic), 10)
-      logger.info("Exploration goal publisher on %s", cfg.goal_topic)
+        Pose, str(cfg.goal_topic), 10)
+      ds._rosnode.create_subscription(
+        Int8, str(cfg.get("goal_status_topic", "/goal_reach_status")),
+        self._on_goal_status, 10)
+      logger.info("Exploration goal publisher on %s (Pose, NED frame); "
+                  "listening for reach status on %s.", cfg.goal_topic,
+                  cfg.get("goal_status_topic", "/goal_reach_status"))
 
   def _derive_half_vfov_deg(self):
     """Half vertical FOV in degrees from the projection intrinsics, or None.
@@ -536,9 +563,47 @@ class ExplorationPlanner:
     except Exception:
       logger.exception("Failed to visualize info grid.")
 
+  # ---------- goal feedback ----------
+
+  def _on_goal_status(self, msg):
+    with self._status_lock:
+      self._latest_status = (int(msg.data), time.time())
+
+  def _should_plan_new_goal(self):
+    """Feedback gate for goal publishing.
+
+    True when no goal is outstanding, or when the outstanding goal was
+    reported reached/failed by a status message received at least
+    status_min_delay seconds after the goal was published (earlier messages
+    are stale feedback about the previous goal). A FAILED goal blacklists
+    its frontier so it is not immediately re-selected.
+    """
+    if self._goal_pub is None or self._last_goal_pub_time is None:
+      return True
+    with self._status_lock:
+      st = self._latest_status
+    if st is None:
+      return False
+    val, t_recv = st
+    if t_recv < self._last_goal_pub_time + self.status_min_delay:
+      return False  # stale status (refers to the previous goal)
+    if val == GOAL_IN_PROGRESS:
+      return False
+    if val == GOAL_FAILED and self._last_goal_key is not None:
+      self._blacklist.add(self._last_goal_key)
+      logger.info("Goal reported FAILED; blacklisted its frontier "
+                  "(%d blacklisted).", len(self._blacklist))
+    elif val == GOAL_REACHED:
+      logger.info("Goal reported REACHED; planning next goal.")
+    self._last_goal_pub_time = None
+    self._last_goal_key = None
+    return True
+
   # ---------- planning cycle ----------
 
   def _plan_once(self):
+    if not self._should_plan_new_goal():
+      return
     robot_pose = self._get_robot_pose_rdf()
     if robot_pose is None:
       return
@@ -581,6 +646,9 @@ class ExplorationPlanner:
         "Exploration goal: pos (%.2f, %.2f, %.2f) observing frontier "
         "(%.2f, %.2f, %.2f).", *goal[:3, 3].tolist(), *f.tolist())
       self._publish_goal(goal, f)
+      if self._goal_pub is not None:
+        self._last_goal_pub_time = time.time()
+        self._last_goal_key = self._bl_key(f)
       return
 
   # ---------- outputs ----------
@@ -596,20 +664,18 @@ class ExplorationPlanner:
       except Exception:
         logger.exception("Failed to visualize exploration goal.")
 
-    # Publish PoseStamped in the source (pose topic) world frame.
+    # Publish a bare geometry_msgs/Pose in the pose-topic (NED) world frame.
     if self._goal_pub is None:
       return
     ds = self.server.dataset
     src2rdf_inv = torch.linalg.inv(ds.src2rdf)
     goal_src = g3d.transform_pose_4x4(goal_rdf, src2rdf_inv)
-    msg = PoseStamped()
-    msg.header.frame_id = str(self.cfg.goal_frame_id)
-    msg.header.stamp = ds._rosnode.get_clock().now().to_msg()
+    msg = Pose()
     t = goal_src[:3, 3].tolist()
     q = Rotation.from_matrix(goal_src[:3, :3].numpy()).as_quat()
-    msg.pose.position.x, msg.pose.position.y, msg.pose.position.z = t
-    (msg.pose.orientation.x, msg.pose.orientation.y,
-     msg.pose.orientation.z, msg.pose.orientation.w) = q.tolist()
+    msg.position.x, msg.position.y, msg.position.z = t
+    (msg.orientation.x, msg.orientation.y,
+     msg.orientation.z, msg.orientation.w) = q.tolist()
     self._goal_pub.publish(msg)
 
 
