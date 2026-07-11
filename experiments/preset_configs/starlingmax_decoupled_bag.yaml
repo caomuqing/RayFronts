@@ -37,7 +37,7 @@ dataset:
 
   depth_topic: null
   depth_intrinsics_file: null
-  point_cloud_topic: "/registered_scan"
+  point_cloud_topic: "/registered_scan_relay"
   point_cloud_frame: "world"
   # Calibrated with scripts/calibrate_scan_transform.py on
   # rosbag2_ric_indoor_open (residual tilt 0.911deg, height -5.5cm of the
@@ -106,7 +106,7 @@ exploration:
   # (e.g. 0.2-0.4) so isolated misclassified voxels cannot poison a cell —
   # mainly useful when grid_cell_size > vox_size.
   obstacle_min_frac: 0.5
-  xmin: -10
-  xmax: 10
-  ymin: -10
-  ymax: 10
+  xmin: -2
+  xmax: 2
+  ymin: -3
+  ymax: 3

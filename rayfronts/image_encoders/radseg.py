@@ -190,6 +190,11 @@ class RADSegEncoder(ImageSemSegEncoder):
       scra_scaling=scra_scaling)
 
     if self.compile:
+      # Register einops with dynamo; RADIO's patch generator calls
+      # einops.rearrange, whose recipe construction torch >= 2.7 cannot
+      # trace otherwise.
+      from einops._torch_specific import allow_ops_in_compiled_graph
+      allow_ops_in_compiled_graph()
       self.model.compile(fullgraph=True, options={"triton.cudagraphs":True})
       self.lang_adaptor.compile(fullgraph=True, options={"triton.cudagraphs":True})
 

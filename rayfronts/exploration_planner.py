@@ -46,6 +46,7 @@ from rayfronts.mapping.semantic_ray_frontiers_map import rayfronts_cpp
 try:
   from geometry_msgs.msg import Pose
   from std_msgs.msg import Int8
+  from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
   from scipy.spatial.transform import Rotation
 except ModuleNotFoundError:
   Pose = None
@@ -171,8 +172,15 @@ class ExplorationPlanner:
     ds = getattr(server, "dataset", None)
     if (Pose is not None and ds is not None
         and getattr(ds, "_rosnode", None) is not None):
+      # Latched (transient_local) so late-joining subscribers receive the
+      # outstanding goal; must also match subscribers requesting
+      # transient_local durability (e.g. the onboard goal follower).
+      goal_qos = QoSProfile(
+        depth=10,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL)
       self._goal_pub = ds._rosnode.create_publisher(
-        Pose, str(cfg.goal_topic), 10)
+        Pose, str(cfg.goal_topic), goal_qos)
       ds._rosnode.create_subscription(
         Int8, str(cfg.get("goal_status_topic", "/goal_reach_status")),
         self._on_goal_status, 10)

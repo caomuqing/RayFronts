@@ -24,11 +24,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget
 
 ## Install python dependencies
+# torch >= 2.7 + cu128 needed for Blackwell GPUs (RTX 50xx, sm_120)
 RUN pip install \
-  torch==2.4.1 \
-  torchvision==0.19.1 \
-  torchaudio==2.4.1 \
-  --index-url https://download.pytorch.org/whl/cu121
+  torch==2.7.1 \
+  torchvision==0.22.1 \
+  torchaudio==2.7.1 \
+  --index-url https://download.pytorch.org/whl/cu128
+
+# torch-scatter ships compiled kernels tied to the torch version above;
+# install from the matching PyG wheel index
+RUN pip install torch-scatter -f https://data.pyg.org/whl/torch-2.7.1+cu128.html
 
 RUN pip install \
   protobuf \
@@ -37,7 +42,6 @@ RUN pip install \
   rerun-sdk==0.22.0 \
   einops \
   timm \
-  torch-scatter==2.1.2 \
   ftfy \
   regex \
   nanobind \
@@ -72,6 +76,10 @@ RUN cmake -DCMAKE_INSTALL_PREFIX=/usr/local \
 
 RUN make -j4
 RUN make install
+
+# transformers 5.x needs PIL.Image.Resampling (Pillow >= 9.1); the system
+# python3-pil package is 9.0.1
+RUN pip install -U pillow
 
 # Clone rayfronts and compile
 WORKDIR /workspace
