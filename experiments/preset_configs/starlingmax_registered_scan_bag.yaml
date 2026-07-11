@@ -20,7 +20,7 @@ defaults:
   - override messaging_service: ros
 
 bag_dir: ../Datasets/rosbag2_2026_07_01-23_52_59
-calibration_dir: ../Datasets/starlingmax_2026_06_24_160055/calibration
+calibration_dir: experiments/calibration/starlingmax_2026_06_24_160055
 
 dataset:
   rgb_topic: "/hires_front_small_color"

@@ -23,7 +23,9 @@ defaults:
   - override messaging_service: ros
 
 bag_dir: ../Datasets/rosbag2_2026_07_01-23_52_59
-calibration_dir: ../Datasets/starlingmax_2026_06_24_160055/calibration
+# Calibration is versioned in-repo (copied from the 2026-06-24 recording
+# session; valid across bags as long as the sensor mounting is unchanged).
+calibration_dir: experiments/calibration/starlingmax_2026_06_24_160055
 
 decoupled_pipeline: true
 semantic_keyframe_period: 5
