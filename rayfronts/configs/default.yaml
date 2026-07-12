@@ -38,14 +38,14 @@ exploration:
   # frontiers (geometric), or semantic_coverage_frontiers.
   frontier_source: class_frontiers
   # Exploration pose: hover_height (h) metres above a selected-class voxel...
-  hover_height: 1.5
+  hover_height: 1.2
   # ...with a fully known-empty sphere of safety_radius (r) around it
   # (unobserved space counts as unsafe)...
-  safety_radius: 0.7
+  safety_radius: 0.3
   # ...within this horizontal standoff range of the frontier, with an
   # occlusion-free line of sight to it.
   view_min_dist: 0.8
-  view_max_dist: 6.0
+  view_max_dist: 8.0
   # The frontier must sit within the camera's viewable elevation band:
   # |depression angle - view_pitch_deg| <= view_max_elevation_deg, where
   # view_pitch_deg is the camera pitch below the horizon (0 = level) and
@@ -54,6 +54,10 @@ exploration:
   # standoff of hover_height / tan(pitch + max_elevation).
   view_pitch_deg: 0.0
   view_max_elevation_deg: null
+  # Inflate the viewable elevation band by this factor (>1 pretends a wider
+  # vertical FOV, admitting closer viewpoints; the frontier may then fall
+  # slightly outside the actual image).
+  view_fov_scale: 1.0
   # Only class voxels within this radius of the frontier are considered as
   # anchor candidates.
   candidate_search_radius: 6.0
@@ -74,6 +78,11 @@ exploration:
   # frontier.
   goal_status_topic: /goal_reach_status
   status_min_delay: 0.3
+  # External enable switch for goal publishing (std_msgs/Int8: 1 = allow,
+  # 0 = suppress). Only gates goal_topic output; mapping, visualization and
+  # goal feedback handling continue as usual. Publishing is allowed until a
+  # 0 is received.
+  goal_publish_allow_topic: /goal_publish_allow
   # 2D information grid (unknown / non-obstacle / obstacle + confidence),
   # built per keyframe from the visible voxels: chosen-class voxels with no
   # other-class voxel beneath them (global-map check) mark non-obstacle;

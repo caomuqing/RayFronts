@@ -22,6 +22,7 @@ import sys
 import os
 import math
 import logging
+import time
 
 import torch
 import openvdb
@@ -121,6 +122,8 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
                occ_pruning_period: int = 1,
                sem_pruning_thresh: int = 0,
                sem_pruning_period: int = 1,
+               sem_label_cache_ttl: float = 0,
+               sem_label_cache_max: int = 100000,
 
                fronti_neighborhood_r: int = 1,
                fronti_min_unobserved: int = 4,
@@ -191,6 +194,13 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
       sem_pruning_period: How often do we prune semantic voxels to reflect
         occupancy (That is erase semantic voxels that are no longer occupied).
         Set to -1 to disable.
+      sem_label_cache_ttl: Seconds to retain pruned semantic voxels in a CPU
+        side cache; a cached voxel that becomes occupied again within the TTL
+        gets its label/features restored instead of reappearing unlabeled
+        (which would spawn spurious coverage/class frontiers around scan
+        jitter). Set to 0 to disable.
+      sem_label_cache_max: Maximum number of cached voxels (oldest evicted
+        first).
 
       fronti_neighborhood_r: 3D neighborhood radius to compute if a voxel is a
         frontier or not.
@@ -269,6 +279,14 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     self.sem_pruning_period = sem_pruning_period
     self.sem_pruning_thresh = sem_pruning_thresh
     self._sem_pruning_cnt = 0
+    # Label-restore cache (CPU): rows pruned from the semantic store are kept
+    # for sem_label_cache_ttl seconds and restored (via the standard weighted
+    # fusion) if their voxel becomes occupied again within that window.
+    self.sem_label_cache_ttl = float(sem_label_cache_ttl)
+    self.sem_label_cache_max = int(sem_label_cache_max)
+    self._sem_cache_xyz = None    # Nx3 float (CPU)
+    self._sem_cache_feat = None   # Nx(3+C+1) float (CPU)
+    self._sem_cache_stamp = None  # N float seconds (CPU)
 
     self.fronti_neighborhood_r = fronti_neighborhood_r
     self.fronti_min_unobserved = fronti_min_unobserved
@@ -676,7 +694,7 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
 
     if (self.debug_log_period > 0
         and self._debug_frame_idx % self.debug_log_period == 0):
-      logger.info(
+      logger.debug(
         "Mapper debug (pointcloud) frame=%d pc_xyz=%d vox_xyz=%d",
         self._debug_frame_idx, pc_xyz.shape[0], vox_xyz.shape[0])
     self._debug_frame_idx += 1
@@ -737,6 +755,11 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     cand = self._get_occupied_voxel_centers()
     if cand is None:
       return update_info
+
+    # Give re-occupied voxels their cached labels back (queued into the tmp
+    # buffers; fused by accum_semantic_voxels below) before coverage/class
+    # frontiers are recomputed against the labeled set.
+    self.restore_cached_semantics(cand)
 
     # Project candidates into the camera.
     cam_pts = g3d.transform_points(cand, torch.linalg.inv(pose_4x4))
@@ -802,7 +825,7 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     if (self.debug_log_period > 0
         and self._debug_frame_idx % self.debug_log_period == 0):
       cov = self.semantic_coverage_frontiers
-      logger.info(
+      logger.debug(
         "Mapper debug (semantic frame) candidates=%d visible=%d "
         "sem_vox=%d coverage_frontiers=%d",
         cand.shape[0], N,
@@ -1306,9 +1329,76 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
           vox_size=self.vox_size
         )
 
+  def _vox_hash(self, xyz):
+    """Int64 hash of voxel centers on the vox_size grid."""
+    c = torch.round(xyz / self.vox_size).long()
+    m = 2**20
+    return (c[:, 0] * m + c[:, 1]) * m + c[:, 2]
+
+  def _sem_cache_add(self, xyz, feat) -> None:
+    """Add pruned semantic rows to the label-restore cache (CPU)."""
+    if xyz.shape[0] == 0:
+      return
+    now = time.time()
+    xyz = xyz.detach().cpu()
+    feat = feat.detach().cpu()
+    stamp = torch.full((xyz.shape[0],), now)
+    if self._sem_cache_xyz is not None and self._sem_cache_xyz.shape[0] > 0:
+      # Drop expired entries and stale duplicates of re-pruned voxels.
+      keep = self._sem_cache_stamp >= now - self.sem_label_cache_ttl
+      keep &= ~torch.isin(self._vox_hash(self._sem_cache_xyz),
+                          self._vox_hash(xyz))
+      self._sem_cache_xyz = torch.cat([self._sem_cache_xyz[keep], xyz])
+      self._sem_cache_feat = torch.cat([self._sem_cache_feat[keep], feat])
+      self._sem_cache_stamp = torch.cat([self._sem_cache_stamp[keep], stamp])
+    else:
+      self._sem_cache_xyz, self._sem_cache_feat, self._sem_cache_stamp = \
+        xyz, feat, stamp
+    if self._sem_cache_xyz.shape[0] > self.sem_label_cache_max:
+      n = self.sem_label_cache_max
+      self._sem_cache_xyz = self._sem_cache_xyz[-n:]
+      self._sem_cache_feat = self._sem_cache_feat[-n:]
+      self._sem_cache_stamp = self._sem_cache_stamp[-n:]
+
+  def restore_cached_semantics(self, occupied_xyz) -> None:
+    """Re-inserts cached labels whose voxel is occupied again.
+
+    Restored rows go through the temporary buffers and the standard weighted
+    fusion (accum_semantic_voxels), so ordering invariants of the global
+    store are preserved and any features the voxel gained in the meantime
+    are blended rather than overwritten.
+
+    Args:
+      occupied_xyz: (Nx3) float tensor of currently occupied voxel centers.
+    """
+    if (self.sem_label_cache_ttl <= 0 or self._sem_cache_xyz is None or
+        self._sem_cache_xyz.shape[0] == 0 or occupied_xyz.shape[0] == 0):
+      return
+    fresh = self._sem_cache_stamp >= time.time() - self.sem_label_cache_ttl
+    if not fresh.any():
+      self._sem_cache_xyz = self._sem_cache_feat = None
+      self._sem_cache_stamp = None
+      return
+    hit = fresh & torch.isin(
+      self._vox_hash(self._sem_cache_xyz),
+      self._vox_hash(occupied_xyz).cpu())
+    if hit.any():
+      xyz = self._sem_cache_xyz[hit].to(self.device)
+      feat = self._sem_cache_feat[hit].to(self.device).clone()
+      # Re-enter with a capped confidence weight so fresh RGB observations
+      # (weight 1 per keyframe) can quickly override a stale restored label.
+      feat[:, -1] = feat[:, -1].clamp(max=3.0)
+      self._tmp_pc_xyz.append(xyz)
+      self._tmp_pc_rgb_feat_cnt.append(feat)
+      logger.debug("Restored %d cached semantic voxels.", xyz.shape[0])
+    keep = fresh & ~hit
+    self._sem_cache_xyz = self._sem_cache_xyz[keep]
+    self._sem_cache_feat = self._sem_cache_feat[keep]
+    self._sem_cache_stamp = self._sem_cache_stamp[keep]
+
   def prune_semantic_voxels(self, updated_pts_xyz) -> None:
     """Remove semantic voxels that are no longer occupied.
-    
+
     Args:
       updated_pts_xyz: (Nx3) Float tensor describing the voxels/points that
         have been updated. Only these points will be considered for removal.
@@ -1324,18 +1414,24 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     vox_xyz_to_remove = updated_vox_xyz[updated_vox_occ.squeeze(-1) <=
                                         self.sem_pruning_thresh]
 
-    self.global_vox_xyz, flag = g3d.intersect_voxels(
+    union, flag = g3d.intersect_voxels(
       self.global_vox_xyz, vox_xyz_to_remove, self.vox_size)
-
-    self.global_vox_xyz = self.global_vox_xyz[flag == 1]
 
     # Strong assumption here that the original global_vox_xyz is sorted !
     # and that the produced global_vox_xyz is also sorted.
     # If both the first input and the output are sorted then the filtered flag
     # will be aligned with the first input.
     # TODO: Double check and have stronger guarantees / fail-safes
+    first_flags = flag[flag >= 0]
+    if self.sem_label_cache_ttl > 0:
+      # Park the removed rows (flag 0 = present in both the store and the
+      # removal set) in the label-restore cache before discarding.
+      self._sem_cache_add(union[flag == 0],
+                          self.global_vox_rgb_feat_cnt[first_flags == 0])
+
+    self.global_vox_xyz = union[flag == 1]
     self.global_vox_rgb_feat_cnt = \
-      self.global_vox_rgb_feat_cnt[flag[flag >= 0] == 1]
+      self.global_vox_rgb_feat_cnt[first_flags == 1]
 
   def update_frontiers(self, active_bbox_min, active_bbox_max) -> None:
     frontiers_update = rayfronts_cpp.parallel_filter_cells_in_bbox(

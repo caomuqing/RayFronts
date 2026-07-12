@@ -60,6 +60,15 @@ sem_pruning_period: 8
 # Voxels with log-odds occupancy <= this value are removed.
 sem_pruning_thresh: 0
 
+# Label-restore cache: pruned semantic voxels are kept (on CPU) for this many
+# seconds; if their voxel becomes occupied again within the window, the label
+# and features are restored instead of the voxel reappearing unlabeled (which
+# spawns spurious coverage/class frontiers around transient scan jitter).
+# Set to 0 to disable. sem_label_cache_max caps the cache size (oldest
+# entries evicted first; ~3 KB per voxel).
+sem_label_cache_ttl: 0
+sem_label_cache_max: 100000
+
 ## Frontier calculation
 
 # 3D neighborhood radius to compute if a voxel is a frontier or not

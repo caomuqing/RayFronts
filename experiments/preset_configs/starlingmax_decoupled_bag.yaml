@@ -32,7 +32,7 @@ semantic_keyframe_period: 5
 
 dataset:
   rgb_topic: "/drone/image_raw"
-  pose_topic: "/odom_px4_fused"
+  pose_topic: "/odom_laser_ned_relay"
   pose_msg_type: "odometry"
 
   depth_topic: null
@@ -84,6 +84,17 @@ mapping:
   # "class_frontiers" layer). Must be labels from the query file.
   class_frontier_classes: ["ground"]
   debug_log_period: 10
+  vox_size: 0.3
+  # Hysteresis on label deletion: erase a voxel's semantics only once it is
+  # confidently empty (log-odds <= -3), not on the first transient carve.
+  # Prevents scan jitter from stripping labels off a patch that immediately
+  # gets re-observed as occupied-but-unlabeled, spawning spurious
+  # class/coverage frontiers around it. (Empty passes are -1 each, capped at
+  # -max_empty_cnt; an occupied hit is +7.)
+  sem_pruning_thresh: -3
+  # Second line of defense: voxels that do get pruned keep their labels in a
+  # CPU cache for this long and are restored if re-occupied within the window.
+  sem_label_cache_ttl: 600
 
 querying:
   text_query_mode: labels
@@ -92,6 +103,10 @@ querying:
   period: 10
 
 exploration:
+  # Pretend the camera vertical FOV is 30% wider so closer viewpoints pass
+  # the elevation-band check (more candidates per frontier; min standoff
+  # drops from ~1.9m to ~1.3m at hover_height 1.2).
+  view_fov_scale: 1.3
   # 2D information grid (unknown / non-obstacle / obstacle + confidence),
   # built per keyframe from the visible voxels: chosen-class voxels with no
   # other-class voxel beneath them (global-map check) mark non-obstacle;
@@ -106,7 +121,7 @@ exploration:
   # (e.g. 0.2-0.4) so isolated misclassified voxels cannot poison a cell —
   # mainly useful when grid_cell_size > vox_size.
   obstacle_min_frac: 0.5
-  xmin: -2
-  xmax: 2
-  ymin: -3
-  ymax: 3
+  xmin: -10
+  xmax: 20
+  ymin: -4
+  ymax: 4

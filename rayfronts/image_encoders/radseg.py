@@ -23,6 +23,7 @@ Typical Usage:
   r = compute_cos_sim(text_features, lang_aligned_feat_map, softmax=True)
 """
 
+from contextlib import contextmanager
 from typing_extensions import override, List, Tuple
 
 import torch
@@ -147,6 +148,7 @@ class RADSegEncoder(ImageSemSegEncoder):
                return_radio_features: bool = True,
                compile: bool = False,
                amp: bool = False,
+               offload_lang_encoder: bool = False,
                predict: bool = False,
                classes: List[str] = None,
                text_query_mode: str = "labels",
@@ -182,6 +184,17 @@ class RADSegEncoder(ImageSemSegEncoder):
     self.lang_adaptor = self.model.adaptors[lang_model]
     self.sam_adaptor = self.model.adaptors["sam"]
     self.model.adaptors = None
+    # Text encoding only runs when the query set changes; optionally park the
+    # language text tower (~3 GB for SigLIP2) on CPU and move it to the device
+    # just for the duration of encode_labels/encode_prompts. Only text_model
+    # is offloaded: the adaptor's head_mlp/feat_mlp project map features to
+    # the language space during mapping and must stay on the device.
+    self.offload_lang_encoder = offload_lang_encoder
+    self._lang_gpu_depth = 0
+    if self.offload_lang_encoder:
+      self.lang_adaptor.text_model = self.lang_adaptor.text_model.to("cpu")
+      if "cuda" in str(self.device):
+        torch.cuda.empty_cache()
     last_block = self.model.model.blocks[-1]
     last_block.attn = SelfCorrelatingRecursiveAttn(
       last_block.attn,
@@ -196,7 +209,11 @@ class RADSegEncoder(ImageSemSegEncoder):
       from einops._torch_specific import allow_ops_in_compiled_graph
       allow_ops_in_compiled_graph()
       self.model.compile(fullgraph=True, options={"triton.cudagraphs":True})
-      self.lang_adaptor.compile(fullgraph=True, options={"triton.cudagraphs":True})
+      if not self.offload_lang_encoder:
+        # Not worth compiling (and keeping cudagraph pools for) a module
+        # that runs once per query change and hops devices.
+        self.lang_adaptor.compile(fullgraph=True,
+                                  options={"triton.cudagraphs":True})
 
     self.predict = predict
     self.prediction_thresh = prediction_thresh
@@ -267,16 +284,41 @@ class RADSegEncoder(ImageSemSegEncoder):
   def cat_name_to_index(self):
     return self._cat_name_to_index
 
+  @contextmanager
+  def _lang_encoder_on_device(self):
+    """Temporarily moves the offloaded language tower to the device.
+
+    Reentrant (encode_labels calls encode_prompts in a loop); the tower is
+    returned to the CPU only when the outermost context exits. No-op when
+    offload_lang_encoder is disabled.
+    """
+    if not self.offload_lang_encoder:
+      yield
+      return
+    self._lang_gpu_depth += 1
+    if self._lang_gpu_depth == 1:
+      self.lang_adaptor.text_model = self.lang_adaptor.text_model.to(
+        self.device)
+    try:
+      yield
+    finally:
+      self._lang_gpu_depth -= 1
+      if self._lang_gpu_depth == 0:
+        self.lang_adaptor.text_model = self.lang_adaptor.text_model.to("cpu")
+        if "cuda" in str(self.device):
+          torch.cuda.empty_cache()
+
   @override
   def encode_labels(self, labels: List[str], onehot: bool = True) -> torch.FloatTensor:
     if self.predict and onehot:
       return super().encode_labels(labels)
     prompts_per_label = self.insert_labels_into_templates(labels)
     all_text_features = list()
-    for i in range(len(labels)):
-      text_features = self.encode_prompts(prompts_per_label[i], onehot=False)
-      text_features = text_features.mean(dim=0, keepdim=True)
-      all_text_features.append(text_features)
+    with self._lang_encoder_on_device():
+      for i in range(len(labels)):
+        text_features = self.encode_prompts(prompts_per_label[i], onehot=False)
+        text_features = text_features.mean(dim=0, keepdim=True)
+        all_text_features.append(text_features)
 
     all_text_features = torch.cat(all_text_features, dim=0)
     return all_text_features
@@ -285,10 +327,11 @@ class RADSegEncoder(ImageSemSegEncoder):
   def encode_prompts(self, prompts: List[str], onehot: bool = True) -> torch.FloatTensor:
     if self.predict and onehot:
       return super().encode_labels(prompts)
-    with torch.autocast("cuda", dtype=torch.float16, enabled=self.amp):
-      text = self.lang_adaptor.tokenizer(prompts).to(self.device)
-      text_features = self.lang_adaptor.encode_text(text)
-      text_features /= text_features.norm(dim=-1, keepdim=True)
+    with self._lang_encoder_on_device():
+      with torch.autocast("cuda", dtype=torch.float16, enabled=self.amp):
+        text = self.lang_adaptor.tokenizer(prompts).to(self.device)
+        text_features = self.lang_adaptor.encode_text(text)
+        text_features /= text_features.norm(dim=-1, keepdim=True)
     return text_features
 
   @override

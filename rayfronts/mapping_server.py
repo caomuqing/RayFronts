@@ -397,7 +397,7 @@ class MappingServer:
               and n_kf % self.cfg.messaging_publish_period == 0):
             self._publish_map_pc()
 
-          logger.info(
+          logger.debug(
             "[kf #%4d#] scans=#%d# frames=#%d# semantic (#%6.4f# ms)",
             n_kf, n_scans, n_frames, sem_p*1e3)
 

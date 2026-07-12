@@ -108,6 +108,15 @@ class ExplorationPlanner:
         logger.info(
           "view_max_elevation_deg derived from intrinsics: %.1f deg "
           "(half vertical FOV).", mev)
+    # Optional inflation of the viewable elevation band. >1 pretends the
+    # camera FOV is wider than it is, admitting closer viewpoints (min
+    # standoff = hover_height / tan(pitch + max_elevation)) at the cost of
+    # the frontier possibly falling slightly outside the actual image.
+    fov_scale = float(cfg.get("view_fov_scale", 1.0))
+    if fov_scale != 1.0:
+      mev = float(mev) * fov_scale
+      logger.info(
+        "view_max_elevation_deg scaled by %.2f -> %.1f deg.", fov_scale, mev)
     self._view_max_elev = math.radians(float(mev))
     self.plan_period = float(cfg.plan_period)
     self.max_attempts_per_cycle = int(cfg.max_attempts_per_cycle)
@@ -169,6 +178,11 @@ class ExplorationPlanner:
     self._last_goal_pub_time = None  # wall-time of the outstanding goal
     self._last_goal_key = None       # blacklist key of the outstanding goal
     self._goal_pub = None
+    # External enable switch for goal publishing (std_msgs/Int8 on
+    # goal_publish_allow_topic: 1 = allow, 0 = suppress). Only gates
+    # /goal_point output; mapping, visualization and feedback handling are
+    # unaffected. Defaults to allowed until a message says otherwise.
+    self._goal_publish_allowed = False
     ds = getattr(server, "dataset", None)
     if (Pose is not None and ds is not None
         and getattr(ds, "_rosnode", None) is not None):
@@ -184,9 +198,14 @@ class ExplorationPlanner:
       ds._rosnode.create_subscription(
         Int8, str(cfg.get("goal_status_topic", "/goal_reach_status")),
         self._on_goal_status, 10)
+      ds._rosnode.create_subscription(
+        Int8, str(cfg.get("goal_publish_allow_topic", "/goal_publish_allow")),
+        self._on_goal_publish_allow, 10)
       logger.info("Exploration goal publisher on %s (Pose, NED frame); "
-                  "listening for reach status on %s.", cfg.goal_topic,
-                  cfg.get("goal_status_topic", "/goal_reach_status"))
+                  "listening for reach status on %s; goal publishing "
+                  "enable switch on %s.", cfg.goal_topic,
+                  cfg.get("goal_status_topic", "/goal_reach_status"),
+                  cfg.get("goal_publish_allow_topic", "/goal_publish_allow"))
 
   def _derive_half_vfov_deg(self):
     """Half vertical FOV in degrees from the projection intrinsics, or None.
@@ -577,6 +596,13 @@ class ExplorationPlanner:
     with self._status_lock:
       self._latest_status = (int(msg.data), time.time())
 
+  def _on_goal_publish_allow(self, msg):
+    allowed = int(msg.data) != 0
+    if allowed != self._goal_publish_allowed:
+      logger.info("Goal publishing %s via goal_publish_allow.",
+                  "enabled" if allowed else "disabled")
+    self._goal_publish_allowed = allowed
+
   def _should_plan_new_goal(self):
     """Feedback gate for goal publishing.
 
@@ -610,6 +636,8 @@ class ExplorationPlanner:
   # ---------- planning cycle ----------
 
   def _plan_once(self):
+    if not self._goal_publish_allowed:
+      return  # goal publishing suppressed externally; keep mapping as usual
     if not self._should_plan_new_goal():
       return
     robot_pose = self._get_robot_pose_rdf()

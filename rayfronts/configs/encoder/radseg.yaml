@@ -26,6 +26,10 @@ compile: ${compile}
 # Whether to use automatic mixed precision when inferring.
 amp: ${amp}
 
+# Keep the language tower (~2 GB for SigLIP2) on CPU, moving it to the GPU
+# only while encoding text queries. Frees VRAM when queries change rarely.
+offload_lang_encoder: True
+
 # Set to true for RADSeg to output segmentation probabilities directly.
 predict: False
 

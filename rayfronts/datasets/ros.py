@@ -1054,15 +1054,15 @@ class StarlingMaxSubscriber(PosedRgbdDataset):
     self._rgb_stamp_cnt += 1
     if len(stamps) == 0:
       if self._rgb_stamp_cnt % self._sync_debug_log_period == 0:
-        logger.info("RGB->pose stamp diff: no poses received yet "
-                    "(%d images so far).", self._rgb_stamp_cnt)
+        logger.debug("RGB->pose stamp diff: no poses received yet "
+                     "(%d images so far).", self._rgb_stamp_cnt)
       return
     diff_s = min(abs(t - stamp_ns) for t in stamps) / 1e9
     self._rgb_pose_diffs.append(diff_s)
     if self._rgb_stamp_cnt % self._sync_debug_log_period == 0:
       d = self._rgb_pose_diffs
       n_over = sum(1 for x in d if x > self._sync_slop)
-      logger.info(
+      logger.debug(
         "RGB->pose stamp diff (closest, last %d imgs): cur=%.3fs min=%.3fs "
         "mean=%.3fs max=%.3fs | %d/%d exceed sync_slop=%.2fs",
         len(d), d[-1], min(d), sum(d)/len(d), max(d),
