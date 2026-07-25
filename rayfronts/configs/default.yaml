@@ -40,8 +40,13 @@ exploration:
   # Exploration pose: hover_height (h) metres above a selected-class voxel...
   hover_height: 1.2
   # ...with a fully known-empty sphere of safety_radius (r) around it
-  # (unobserved space counts as unsafe)...
+  # (unobserved space counts as unsafe unless safety_allow_unknown)...
   safety_radius: 0.3
+  # Accept unobserved voxels inside the safety sphere (only observed-occupied
+  # rejects a candidate). Matches the LOS check's treatment of unknown space;
+  # goals may then sit in never-scanned air, so the goal follower's local
+  # avoidance must be trusted to handle surprises there.
+  safety_allow_unknown: False
   # ...within this horizontal standoff range of the frontier, with an
   # occlusion-free line of sight to it.
   view_min_dist: 0.8
@@ -61,10 +66,25 @@ exploration:
   # Only class voxels within this radius of the frontier are considered as
   # anchor candidates.
   candidate_search_radius: 6.0
+  # Viewpoint ranking: cost = distance_to_robot + frontier_proximity_weight
+  # * horizontal_standoff_to_frontier. 0 = pick whatever is cheapest to
+  # reach (drone observes from afar and barely advances); >0 pushes goals
+  # toward the frontier (bounded below by the elevation-band min standoff),
+  # so reaching a goal actively expands the mapped area.
+  frontier_proximity_weight: 0.0
   # Cap on candidates checked per frontier and frontiers tried per cycle
-  # (failed frontiers are blacklisted/removed).
-  max_candidates: 128
+  # (failed frontiers are blacklisted/removed). When more candidates exist,
+  # the nearest half is kept plus a uniform random spread of the rest.
+  max_candidates: 512
   max_attempts_per_cycle: 10
+  # Failed frontiers are banned with exponential backoff instead of forever:
+  # ban = blacklist_base_ban_s * 2^(fails-1), capped at blacklist_max_ban_s.
+  # The fail count persists across expiries, so hopeless frontiers are
+  # retried progressively less often; a goal reported FAILED counts as two
+  # failures. Rechecks matter because "no safe viewpoint" depends on map
+  # state, which improves as space is carved/labeled.
+  blacklist_base_ban_s: 15.0
+  blacklist_max_ban_s: 240.0
   # Seconds between planning cycles.
   plan_period: 2.0
   # Goal output: bare geometry_msgs/Pose in the pose-topic world frame

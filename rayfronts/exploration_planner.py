@@ -121,6 +121,9 @@ class ExplorationPlanner:
     self.plan_period = float(cfg.plan_period)
     self.max_attempts_per_cycle = int(cfg.max_attempts_per_cycle)
     self.max_candidates = int(cfg.max_candidates)
+    self.safety_allow_unknown = bool(cfg.get("safety_allow_unknown", False))
+    self.frontier_proximity_weight = float(
+      cfg.get("frontier_proximity_weight", 0.0))
 
     self.vox_size = float(self.mapper.vox_size)
 
@@ -147,10 +150,16 @@ class ExplorationPlanner:
         "Exploration bounds active: x [%s, %s], y [%s, %s] (pose frame).",
         cfg.xmin, cfg.xmax, cfg.ymin, cfg.ymax)
     # Blacklist keys are rounded to the frontier cluster grid so recomputed
-    # frontiers at the same location stay removed.
+    # frontiers at the same location stay removed. Bans expire with
+    # exponential backoff (ban = base * 2^(fails-1), capped) so a frontier
+    # that had no safe viewpoint is rechecked once the map matures; the fail
+    # count survives expiry, so repeat offenders get progressively longer
+    # bans. dict: key -> [fail_count, ban_expiry_walltime].
     self._bl_grid = self.vox_size * float(
       getattr(self.mapper, "class_frontier_subsampling", 3))
-    self._blacklist = set()
+    self._blacklist = {}
+    self.blacklist_base_ban_s = float(cfg.get("blacklist_base_ban_s", 15.0))
+    self.blacklist_max_ban_s = float(cfg.get("blacklist_max_ban_s", 240.0))
 
     # Precompute safety-sphere offsets at voxel resolution.
     n = max(1, int(math.ceil(self.safety_radius / self.vox_size)))
@@ -309,6 +318,23 @@ class ExplorationPlanner:
   def _bl_key(self, p):
     return tuple(torch.round(p / self._bl_grid).long().tolist())
 
+  def _blacklist_add(self, key, severity=1):
+    """Registers a failure for key; returns the resulting ban in seconds.
+
+    severity is added to the fail count (use >1 for stronger offenses, e.g.
+    a goal the drone physically failed to reach).
+    """
+    cnt = self._blacklist.get(key, (0, 0.0))[0] + severity
+    ban = min(self.blacklist_base_ban_s * 2.0 ** (cnt - 1),
+              self.blacklist_max_ban_s)
+    self._blacklist[key] = (cnt, time.time() + ban)
+    return ban
+
+  def _blacklisted(self, key):
+    """True while key's ban has not yet expired."""
+    entry = self._blacklist.get(key)
+    return entry is not None and time.time() < entry[1]
+
   # ---------- core logic (pure given inputs) ----------
 
   def rank_frontiers(self, robot_pose_4x4, frontiers):
@@ -384,24 +410,50 @@ class ExplorationPlanner:
     keep = ((choriz >= self.view_min_dist) & (choriz <= self.view_max_dist) &
             ((depression - self._view_pitch).abs() <= self._view_max_elev))
     cand = cand[keep]
+    cand_standoff = choriz[keep]
     if cand.shape[0] == 0:
       return None
 
-    # Prefer candidates cheap to reach.
+    # Rank candidates by cost = distance-to-robot + frontier_proximity_weight
+    # * horizontal standoff. Weight 0 = cheapest to reach (drone observes
+    # from wherever is convenient); larger weights push the goal toward the
+    # frontier so reaching it actually advances the frontier. Don't let one
+    # bad pocket exhaust the budget: keep the best half, then a uniform
+    # random spread of the remainder (kept in cost order) so every region of
+    # the standoff ring gets probed.
     ref = robot_pos if robot_pos is not None else frontier
-    order = torch.argsort((cand - ref.reshape(1, 3)).norm(dim=-1))
-    cand = cand[order][:self.max_candidates]
+    cost = ((cand - ref.reshape(1, 3)).norm(dim=-1) +
+            self.frontier_proximity_weight * cand_standoff)
+    order = torch.argsort(cost)
+    if order.shape[0] > self.max_candidates:
+      n_near = self.max_candidates // 2
+      rest = order[n_near:]
+      pick = torch.randperm(rest.shape[0])[:self.max_candidates - n_near]
+      order = torch.cat([order[:n_near], rest[pick.sort().values]])
+    cand = cand[order]
 
-    # Safety: the whole sphere must be known-empty (log-odds < 0).
+    # Safety: no point of the sphere may be occupied (log-odds > 0). By
+    # default unobserved space (log-odds 0) also counts as unsafe; with
+    # safety_allow_unknown it is accepted (consistent with the LOS check),
+    # trusting the follower's local avoidance in never-scanned air.
     C, S = cand.shape[0], self._sphere_offsets.shape[0]
     pts = (cand.reshape(C, 1, 3) +
            self._sphere_offsets.reshape(1, S, 3)).reshape(-1, 3)
     occ = self._query_occ(pts).reshape(C, S)
-    safe = (occ < 0).all(dim=-1)
+    if self.safety_allow_unknown:
+      safe = (occ <= 0).all(dim=-1)
+    else:
+      safe = (occ < 0).all(dim=-1)
 
+    # Aim the sight line one voxel above the frontier: a ground frontier sits
+    # inside the occupied surface layer, so a ray to the exact surface point
+    # grazes through neighboring ground voxels at shallow approach angles and
+    # falsely reports occlusion (blocking distant candidates in particular).
+    f_view = frontier.clone()
+    f_view[1] -= self.vox_size  # up = -y (world RDF)
     for i in torch.nonzero(safe).reshape(-1):
       pos = cand[i]
-      if self._los_clear(pos, frontier):
+      if self._los_clear(pos, f_view):
         return self._goal_pose(pos, frontier)
     return None
 
@@ -624,9 +676,11 @@ class ExplorationPlanner:
     if val == GOAL_IN_PROGRESS:
       return False
     if val == GOAL_FAILED and self._last_goal_key is not None:
-      self._blacklist.add(self._last_goal_key)
-      logger.info("Goal reported FAILED; blacklisted its frontier "
-                  "(%d blacklisted).", len(self._blacklist))
+      # A physically unreachable goal is a stronger signal than a missing
+      # viewpoint; start it deeper into the backoff.
+      ban = self._blacklist_add(self._last_goal_key, severity=2)
+      logger.info("Goal reported FAILED; frontier banned for %.0fs "
+                  "(%d blacklisted).", ban, len(self._blacklist))
     elif val == GOAL_REACHED:
       logger.info("Goal reported REACHED; planning next goal.")
     self._last_goal_pub_time = None
@@ -652,12 +706,12 @@ class ExplorationPlanner:
       frontiers = frontiers.detach().cpu().clone()
       class_vox = class_vox.detach().cpu().clone()
 
-    # Drop blacklisted frontiers.
+    # Drop frontiers with an active (unexpired) ban.
     keep = [i for i in range(frontiers.shape[0])
-            if self._bl_key(frontiers[i]) not in self._blacklist]
+            if not self._blacklisted(self._bl_key(frontiers[i]))]
     if len(keep) == 0:
-      logger.info("Exploration: all %d frontiers blacklisted; waiting for "
-                  "new frontiers.", frontiers.shape[0])
+      logger.info("Exploration: all %d frontiers banned; waiting for new "
+                  "frontiers or ban expiry.", frontiers.shape[0])
       return
     frontiers = frontiers[keep]
 
@@ -671,10 +725,11 @@ class ExplorationPlanner:
       with self.server.map_lock:
         goal = self.find_exploration_pose(f, class_vox, robot_pos)
       if goal is None:
-        self._blacklist.add(self._bl_key(f))
+        ban = self._blacklist_add(self._bl_key(f))
         logger.info(
           "Exploration: no safe viewpoint for frontier (%.2f, %.2f, %.2f); "
-          "removed (%d blacklisted).", *f.tolist(), len(self._blacklist))
+          "banned for %.0fs (%d blacklisted).", *f.tolist(), ban,
+          len(self._blacklist))
         continue
 
       self.current_goal = (goal, f)

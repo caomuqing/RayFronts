@@ -23,6 +23,7 @@ Typical Usage:
   r = compute_cos_sim(text_features, lang_aligned_feat_map, softmax=True)
 """
 
+import os
 from contextlib import contextmanager
 from typing_extensions import override, List, Tuple
 
@@ -173,10 +174,20 @@ class RADSegEncoder(ImageSemSegEncoder):
     self.model_version = model_version
     self.return_radio_features = return_radio_features
     adaptor_names = [lang_model, "sam"]
-    self.model = torch.hub.load("NVlabs/RADIO", "radio_model",
-                                version=model_version, progress=True,
-                                skip_validation=True,
-                                adaptor_names=adaptor_names)
+    # torch.hub.load(repo, ...) probes github.com to resolve the branch even
+    # with skip_validation, so it fails without internet although the repo is
+    # cached. Load from the local hub cache when present (checkpoints load
+    # from their own cache too); fall back to github on first-ever run.
+    radio_cache = os.path.join(torch.hub.get_dir(), "NVlabs_RADIO_main")
+    if os.path.isdir(radio_cache):
+      self.model = torch.hub.load(radio_cache, "radio_model", source="local",
+                                  version=model_version, progress=True,
+                                  adaptor_names=adaptor_names)
+    else:
+      self.model = torch.hub.load("NVlabs/RADIO", "radio_model",
+                                  version=model_version, progress=True,
+                                  skip_validation=True,
+                                  adaptor_names=adaptor_names)
     self.model.eval()
     self.model = self.model.to(self.device)
     # Steal adaptors from RADIO so it does not auto compute adaptor output.

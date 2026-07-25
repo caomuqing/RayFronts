@@ -82,7 +82,7 @@ mapping:
   max_empty_pts_per_frame: 500000
   # Boundary frontiers of these classes vs unlabeled/unknown space (cyan
   # "class_frontiers" layer). Must be labels from the query file.
-  class_frontier_classes: ["ground"]
+  class_frontier_classes: ["ground", "grass"]
   debug_log_period: 10
   vox_size: 0.3
   # Hysteresis on label deletion: erase a voxel's semantics only once it is
@@ -103,10 +103,18 @@ querying:
   period: 10
 
 exploration:
-  # Pretend the camera vertical FOV is 30% wider so closer viewpoints pass
-  # the elevation-band check (more candidates per frontier; min standoff
-  # drops from ~1.9m to ~1.3m at hover_height 1.2).
-  view_fov_scale: 1.3
+  # Elevation-band inflation factor. 1.0 = use the true camera FOV (min
+  # standoff ~1.9m at hover_height 1.2); raise (e.g. 1.3 -> ~1.3m standoff)
+  # to admit closer viewpoints at the cost of the frontier possibly falling
+  # slightly outside the actual image.
+  view_fov_scale: 1.0
+  # Goal viewpoints may sit in unobserved air (only observed-occupied voxels
+  # reject); the onboard follower's local avoidance covers surprises.
+  safety_allow_unknown: True
+  # Push the frontier: strongly prefer viewpoints close to it (1m closer to
+  # the frontier is worth 3m of extra travel), so goals sit near the
+  # elevation-band minimum standoff (~1.3m) instead of wherever is cheap.
+  frontier_proximity_weight: 3.0
   # 2D information grid (unknown / non-obstacle / obstacle + confidence),
   # built per keyframe from the visible voxels: chosen-class voxels with no
   # other-class voxel beneath them (global-map check) mark non-obstacle;
@@ -121,7 +129,7 @@ exploration:
   # (e.g. 0.2-0.4) so isolated misclassified voxels cannot poison a cell —
   # mainly useful when grid_cell_size > vox_size.
   obstacle_min_frac: 0.5
-  xmin: -10
+  xmin: 0.0
   xmax: 20
-  ymin: -4
-  ymax: 4
+  ymin: -6
+  ymax: 6
