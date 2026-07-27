@@ -115,12 +115,16 @@ exploration:
   # the frontier is worth 3m of extra travel), so goals sit near the
   # elevation-band minimum standoff (~1.3m) instead of wherever is cheap.
   frontier_proximity_weight: 3.0
+  # Hierarchical region exploration: segment unknown space into subregions,
+  # commit to the nearest, approach it, exhaust its frontiers, move on
+  # (see default.yaml `region_*` for all knobs).
+  region_mode: True
   # 2D information grid (unknown / non-obstacle / obstacle + confidence),
   # built per keyframe from the visible voxels: chosen-class voxels with no
   # other-class voxel beneath them (global-map check) mark non-obstacle;
   # other-class voxels within obstacle_max_height_voxels above a chosen-class
   # voxel mark obstacle. Obstacle wins cell conflicts.
-  grid_cell_size: 0.8
+  grid_cell_size: 0.5
   obstacle_max_height_voxels: 10
   # A cell is an obstacle iff it has at least one obstacle vote AND
   # obstacle_votes / total_votes >= obstacle_min_frac (votes are per voxel,
@@ -129,7 +133,9 @@ exploration:
   # (e.g. 0.2-0.4) so isolated misclassified voxels cannot poison a cell —
   # mainly useful when grid_cell_size > vox_size.
   obstacle_min_frac: 0.5
-  xmin: 0.0
-  xmax: 20
-  ymin: -6
-  ymax: 6
+  xmin: 4.0
+  xmax: 15
+  ymin: -3
+  ymax: 15
+
+  region_time_budget_s: 180

@@ -41,7 +41,7 @@ exploration:
   hover_height: 1.2
   # ...with a fully known-empty sphere of safety_radius (r) around it
   # (unobserved space counts as unsafe unless safety_allow_unknown)...
-  safety_radius: 0.3
+  safety_radius: 0.6
   # Accept unobserved voxels inside the safety sphere (only observed-occupied
   # rejects a candidate). Matches the LOS check's treatment of unknown space;
   # goals may then sit in never-scanned air, so the goal follower's local
@@ -85,6 +85,30 @@ exploration:
   # state, which improves as space is carved/labeled.
   blacklist_base_ban_s: 15.0
   blacklist_max_ban_s: 240.0
+  # Region-based hierarchical exploration (MAIPP-style). The semantically
+  # unexplored space inside the xy bounds — info-grid cells (grid_cell_size)
+  # with no ground/obstacle classification yet — is segmented into
+  # 8-connected components (above region_max_area_m2 median-split; below
+  # region_min_area_m2 dropped). The planner commits to the nearest region:
+  # while it holds < region_min_frontiers active frontiers, goals chase the
+  # frontier closest to the region centroid (approach); once frontiers
+  # appear inside, only those are explored (cover). A region completes when
+  # the classified fraction of its cells reaches region_coverage_done or
+  # region_time_budget_s elapses; completed regions are excluded from
+  # re-selection for region_retire_cooldown_s. When no unknown regions
+  # remain, behavior falls back to global frontier ranking. Requires the xy
+  # bounds to be set.
+  region_mode: False
+  region_min_area_m2: 1.0
+  region_max_area_m2: 25.0
+  # Approach->cover switch: frontiers inside the region needed to count it
+  # as "in view" and restrict exploration to it.
+  region_min_frontiers: 1
+  # Completion: classified fraction of the region's cells at which it is
+  # considered covered.
+  region_coverage_done: 0.85
+  region_time_budget_s: 180.0
+  region_retire_cooldown_s: 180.0
   # Seconds between planning cycles.
   plan_period: 2.0
   # Goal output: bare geometry_msgs/Pose in the pose-topic world frame

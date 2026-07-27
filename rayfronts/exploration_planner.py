@@ -51,6 +51,11 @@ try:
 except ModuleNotFoundError:
   Pose = None
 
+try:
+  from scipy.ndimage import label as scipy_label
+except ModuleNotFoundError:
+  scipy_label = None
+
 logger = logging.getLogger(__name__)
 
 # /goal_reach_status convention (std_msgs/Int8):
@@ -160,6 +165,31 @@ class ExplorationPlanner:
     self._blacklist = {}
     self.blacklist_base_ban_s = float(cfg.get("blacklist_base_ban_s", 15.0))
     self.blacklist_max_ban_s = float(cfg.get("blacklist_max_ban_s", 240.0))
+
+    # Region-based hierarchical exploration (MAIPP-style): segment the
+    # semantically unexplored space (info-grid cells never classified)
+    # inside the xy bounds into connected components, commit to the nearest
+    # one, approach it via the frontier closest to its centroid, then
+    # exhaust its frontiers before moving on. See _region_plan for the
+    # state machine.
+    self.region_mode = bool(cfg.get("region_mode", False))
+    self.region_min_area_m2 = float(cfg.get("region_min_area_m2", 1.0))
+    self.region_max_area_m2 = float(cfg.get("region_max_area_m2", 25.0))
+    self.region_min_frontiers = int(cfg.get("region_min_frontiers", 1))
+    self.region_coverage_done = float(cfg.get("region_coverage_done", 0.85))
+    self.region_time_budget_s = float(cfg.get("region_time_budget_s", 180.0))
+    self.region_retire_cooldown_s = float(
+      cfg.get("region_retire_cooldown_s", 180.0))
+    self._region = None   # dict(cells, centroid, t_start)
+    self._retired = {}    # cell (i, j) -> retirement expiry walltime
+    if self.region_mode and self.bounds_rdf is None:
+      logger.warning("region_mode requires exploration xy bounds "
+                     "(xmin/xmax/ymin/ymax); falling back to global mode.")
+      self.region_mode = False
+    if self.region_mode and scipy_label is None:
+      logger.warning("region_mode requires scipy.ndimage; falling back to "
+                     "global mode.")
+      self.region_mode = False
 
     # Precompute safety-sphere offsets at voxel resolution.
     n = max(1, int(math.ceil(self.safety_radius / self.vox_size)))
@@ -334,6 +364,190 @@ class ExplorationPlanner:
     """True while key's ban has not yet expired."""
     entry = self._blacklist.get(key)
     return entry is not None and time.time() < entry[1]
+
+  # ---------- region-based hierarchical exploration ----------
+
+  def _region_grid(self):
+    """Info-grid index window covering the bounds.
+
+    Returns (ix0, iz0, nx, nz): region cells are the info-grid cells
+    (centers at ix*grid_cell_size, iz*grid_cell_size) whose centers lie
+    inside the exploration bounds; array index (i, j) maps to info-grid key
+    (i + ix0, j + iz0).
+    """
+    mn, mx = self.bounds_rdf
+    g = self.grid_cell_size
+    ix0 = int(math.ceil(float(mn[0]) / g))
+    iz0 = int(math.ceil(float(mn[2]) / g))
+    nx = max(1, int(math.floor(float(mx[0]) / g)) - ix0 + 1)
+    nz = max(1, int(math.floor(float(mx[2]) / g)) - iz0 + 1)
+    return ix0, iz0, nx, nz
+
+  def _unknown_mask(self):
+    """Boolean [nx, nz] numpy mask of semantically unexplored cells.
+
+    A cell is unknown while it has no entry in the 2D info grid, i.e. the
+    camera has never classified ground/obstacle there (mere lidar coverage
+    does not count — the mission is semantic coverage). Cells of recently
+    completed regions (retired, on cooldown) are masked out so the planner
+    does not immediately re-select them.
+    """
+    ix0, iz0, nx, nz = self._region_grid()
+    unknown = np.ones((nx, nz), dtype=bool)
+    for (ix, iz) in self.info_grid.keys():
+      i, j = ix - ix0, iz - iz0
+      if 0 <= i < nx and 0 <= j < nz:
+        unknown[i, j] = False
+    now = time.time()
+    self._retired = {c: t for c, t in self._retired.items() if t > now}
+    for (i, j) in self._retired:
+      if 0 <= i < nx and 0 <= j < nz:
+        unknown[i, j] = False
+    return unknown
+
+  def _segment_unknown(self, unknown):
+    """Splits the unknown mask into region cell sets.
+
+    8-connected components, recursively median-split along the higher-
+    variance axis above region_max_area_m2, dropped below
+    region_min_area_m2.
+    """
+    labeled, n = scipy_label(unknown, structure=np.ones((3, 3), dtype=int))
+    cs2 = self.grid_cell_size ** 2
+    min_cells = max(1, int(round(self.region_min_area_m2 / cs2)))
+    max_cells = max(min_cells * 2, int(round(self.region_max_area_m2 / cs2)))
+    regions = []
+    for k in range(1, n + 1):
+      idx = np.argwhere(labeled == k)  # [K, 2] (i, j)
+      if idx.shape[0] < min_cells:
+        continue
+      regions.extend(self._split_cells(idx, max_cells))
+    return [set(map(tuple, r.tolist())) for r in regions]
+
+  def _split_cells(self, idx, max_cells):
+    if idx.shape[0] <= max_cells:
+      return [idx]
+    axis = int(np.argmax(idx.astype(np.float32).var(axis=0)))
+    order = np.argsort(idx[:, axis], kind="stable")
+    mid = idx.shape[0] // 2
+    return (self._split_cells(idx[order[:mid]], max_cells) +
+            self._split_cells(idx[order[mid:]], max_cells))
+
+  def _region_centroid(self, cells):
+    """World (x, z) centroid of a region cell set (array indices)."""
+    ix0, iz0, _, _ = self._region_grid()
+    g = self.grid_cell_size
+    arr = np.array(sorted(cells), dtype=np.float32)
+    return ((float(arr[:, 0].mean()) + ix0) * g,
+            (float(arr[:, 1].mean()) + iz0) * g)
+
+  def _frontier_region_mask(self, frontiers, cells):
+    """Boolean mask of frontiers whose (x, z) cell belongs to `cells`."""
+    ix0, iz0, _, _ = self._region_grid()
+    g = self.grid_cell_size
+    i = torch.round(frontiers[:, 0] / g).long() - ix0
+    j = torch.round(frontiers[:, 2] / g).long() - iz0
+    return torch.tensor(
+      [(int(a), int(b)) in cells for a, b in zip(i.tolist(), j.tolist())],
+      dtype=torch.bool)
+
+  def _retire_region(self, reason):
+    expiry = time.time() + self.region_retire_cooldown_s
+    for c in self._region["cells"]:
+      self._retired[c] = expiry
+    logger.info(
+      "Region at (%.1f, %.1f) done: %s (%d cells, %.0fs cooldown).",
+      *self._region["centroid"], reason, len(self._region["cells"]),
+      self.region_retire_cooldown_s)
+    self._region = None
+
+  def _region_plan(self, frontiers, robot_pose, class_vox):
+    """Hierarchical layer over frontier selection.
+
+    Maintains a target subregion of unknown space and returns
+    (frontier_subset, attempt_order) for the viewpoint search:
+    - COVER: the region holds >= region_min_frontiers active frontiers;
+      only those are attempted, ranked by the standard cost.
+    - APPROACH: too few frontiers inside yet; all frontiers are attempted,
+      ordered by distance to the region centroid (robot distance as
+      tiebreak), pulling the map toward the region.
+    - Fallback: no unknown regions remain -> global ranking.
+    A region completes when the classified fraction of its cells reaches
+    region_coverage_done or region_time_budget_s elapses.
+    """
+    unknown = self._unknown_mask()
+    unknown_set = set(map(tuple, np.argwhere(unknown).tolist()))
+    robot_pos = robot_pose[:3, 3]
+
+    # Completion checks on the current region.
+    if self._region is not None:
+      cells = self._region["cells"]
+      cov = 1.0 - len(cells & unknown_set) / max(len(cells), 1)
+      age = time.time() - self._region["t_start"]
+      if cov >= self.region_coverage_done:
+        self._retire_region("coverage %.0f%% reached" % (cov * 100))
+      elif age > self.region_time_budget_s:
+        self._retire_region("time budget exceeded (%.0fs, coverage %.0f%%)"
+                            % (age, cov * 100))
+
+    # Cells retired above (this same cycle) must not be re-selectable.
+    if self._retired:
+      nx, nz = unknown.shape
+      for (i, j) in self._retired:
+        if 0 <= i < nx and 0 <= j < nz:
+          unknown[i, j] = False
+      unknown_set -= set(self._retired.keys())
+
+    # Select the nearest incomplete region if none is active.
+    if self._region is None:
+      regions = self._segment_unknown(unknown)
+      if len(regions) == 0:
+        self._vis_regions(unknown_set, class_vox)
+        return frontiers, self.rank_frontiers(robot_pose, frontiers)
+      cents = [self._region_centroid(c) for c in regions]
+      dists = [math.hypot(cx - float(robot_pos[0]), cz - float(robot_pos[2]))
+               for cx, cz in cents]
+      k = int(np.argmin(dists))
+      self._region = dict(cells=regions[k], centroid=cents[k],
+                          t_start=time.time(), seen=False)
+      logger.info(
+        "Region selected: centroid (%.1f, %.1f), %.1f m^2, %.1fm away "
+        "(%d candidate regions).", *cents[k],
+        len(regions[k]) * self.grid_cell_size ** 2, dists[k], len(regions))
+
+    self._vis_regions(unknown_set, class_vox)
+
+    cells = self._region["cells"]
+    in_mask = self._frontier_region_mask(frontiers, cells)
+    if int(in_mask.sum()) >= self.region_min_frontiers:
+      sub = frontiers[in_mask]
+      return sub, self.rank_frontiers(robot_pose, sub)
+    cx, cz = self._region["centroid"]
+    d_cent = ((frontiers[:, 0] - cx) ** 2 + (frontiers[:, 2] - cz) ** 2).sqrt()
+    d_robot = (frontiers - robot_pos.reshape(1, 3)).norm(dim=-1)
+    return frontiers, torch.argsort(d_cent + 1e-3 * d_robot)
+
+  def _vis_regions(self, unknown_set, class_vox):
+    """Rerun overlay: unknown cells (gray) + current region (orange)."""
+    vis = getattr(self.server, "vis", None)
+    if vis is None or not hasattr(vis, "log_pc") or len(unknown_set) == 0:
+      return
+    try:
+      ix0, iz0, _, _ = self._region_grid()
+      g = self.grid_cell_size
+      gy = float(class_vox[:, 1].median())
+      cur = self._region["cells"] if self._region is not None else set()
+      cells = sorted(unknown_set)
+      pts = torch.tensor(
+        [[(i + ix0) * g, gy, (j + iz0) * g] for i, j in cells],
+        dtype=torch.float)
+      colors = torch.tensor(
+        [[255, 140, 0] if c in cur else [90, 90, 90] for c in cells],
+        dtype=torch.uint8)
+      radii = torch.full((len(cells),), 0.35 * g)
+      vis.log_pc(pts, colors, radii, layer="exploration/regions")
+    except Exception:
+      logger.exception("Failed to visualize exploration regions.")
 
   # ---------- core logic (pure given inputs) ----------
 
@@ -715,8 +929,15 @@ class ExplorationPlanner:
       return
     frontiers = frontiers[keep]
 
-    order = self.rank_frontiers(robot_pose.cpu(), frontiers)
-    robot_pos = robot_pose[:3, 3].cpu()
+    robot_pose_cpu = robot_pose.cpu()
+    robot_pos = robot_pose_cpu[:3, 3]
+    if self.region_mode:
+      frontiers, order = self._region_plan(
+        frontiers, robot_pose_cpu, class_vox)
+      if frontiers.shape[0] == 0:
+        return
+    else:
+      order = self.rank_frontiers(robot_pose_cpu, frontiers)
 
     for rank, i in enumerate(order.tolist()):
       if rank >= self.max_attempts_per_cycle:
