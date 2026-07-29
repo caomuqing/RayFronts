@@ -12,12 +12,19 @@ from std_msgs.msg import ColorRGBA
 import scipy.ndimage
 
 class BehaviorManager:
-    def __init__(self, get_clock):
+    def __init__(self, get_clock, geo_frame=None,
+                 map_min_x=None, map_max_x=None,
+                 map_min_y=None, map_max_y=None,
+                 keepout_polygons=None):
         self.behavior_mode = 'Frontier-based'
         self.get_clock = get_clock
         #self.voxel_behavior = VoxelBehavior(self.get_clock)
         self.ray_behavior = RayBehavior(self.get_clock)
-        self.frontier_behavior = FrontierBehavior(self.get_clock)
+        self.frontier_behavior = FrontierBehavior(
+            self.get_clock, geo_frame=geo_frame,
+            map_min_x=map_min_x, map_max_x=map_max_x,
+            map_min_y=map_min_y, map_max_y=map_max_y,
+            keepout_polygons=keepout_polygons)
         self.behaviors = [self.ray_behavior, self.frontier_behavior]
 
     def mode_select(self, queries_labels, target_objects, queries_feats, mapper, publisher_dict, subscriber_dict):

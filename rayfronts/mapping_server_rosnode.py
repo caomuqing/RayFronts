@@ -43,10 +43,18 @@ from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs.msg import Image
 from std_msgs.msg import Header, ColorRGBA
 from sensor_msgs_py import point_cloud2
+from sensor_msgs.msg import NavSatFix
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from rayfronts import geometry3d as g3d
+from rayfronts.geo_frame import FrontierFrame
 from rayfronts.utils import compute_cos_sim
+from rclpy.qos import (
+    QoSProfile,
+    ReliabilityPolicy,
+    DurabilityPolicy,
+    HistoryPolicy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +88,61 @@ class MappingServer(Node):
     self.dataset: datasets.PosedRgbdDataset = \
       hydra.utils.instantiate(cfg.dataset)
 
-    self.behavior_manager = BehaviorManager(get_clock=self.get_clock)
+    # Frontier-mapping frame: a mission-level frame defined by a global origin
+    # (lat/lon/alt) and a heading (deg CCW from East). Frontiers are only
+    # eligible for the global plan if they fall inside the map_min/max_x/y box
+    # expressed in this frame. Its origin in the local/odom frame ("home") is
+    # estimated online from GPS + odometry (see gps_callback / the run loop).
+    self.geo_frame = FrontierFrame(
+      origin_lat=40.413131,
+      origin_lon=-79.946393,
+      origin_alt=220.80565047594274,
+      heading_deg=-76.17)
+
+    # Inscribed box (fully inside the 4 surveyed boundary corners) in the
+    # frontier frame at heading -76.17. See bound_coordinates.
+    # self.map_min_x, self.map_max_x = -34.86, 37.33
+    # self.map_min_y, self.map_max_y = -32.09, 29.82
+    self.map_min_x, self.map_max_x = -34.86, 34.33
+    self.map_min_y, self.map_max_y = -20.09, 15.82
+
+    # Keepout zones (surveyed corners, WGS84; see bound_coordinates). No
+    # frontier inside these polygons may be chosen for the global plan. They
+    # need not lie fully within the map_min/max box. Converted once to
+    # frontier-frame xy (depends only on origin/heading, not on home).
+    keepout_zones_gps = [
+      [(40.41340, -79.94609), (40.41333, -79.94631),
+       (40.41367, -79.94647), (40.41374, -79.94624)],
+      [(40.41316, -79.94650), (40.41311, -79.94686),
+       (40.41356, -79.94694), (40.41361, -79.94663)],
+    ]
+    self.keepout_polygons = [
+      np.stack([self.geo_frame.gps_to_frame(lat, lon)[:2] for lat, lon in zone])
+      for zone in keepout_zones_gps]
+
+    self.behavior_manager = BehaviorManager(
+      get_clock=self.get_clock,
+      geo_frame=self.geo_frame,
+      map_min_x=self.map_min_x, map_max_x=self.map_max_x,
+      map_min_y=self.map_min_y, map_max_y=self.map_max_y,
+      keepout_polygons=self.keepout_polygons)
+
+    # Latest GPS fix (NavSatFix), used to estimate the local->frontier-frame
+    # transform. Same topic the compass planner uses.
+    self._latest_gps = None
+    gps_qos = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        durability=DurabilityPolicy.VOLATILE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=10,
+    )
+
+    self.create_subscription(
+        NavSatFix,
+        '/robot_1/interface/mavros/global_position/global',
+        self.gps_callback,
+        gps_qos,
+    )
     
     self.path_publisher = self.create_publisher(Path, '/robot_1/global_plan', 10)
     #self.pc2_publisher = self.create_publisher(PointCloud2, '/colored_pointcloud', 10)
@@ -93,6 +155,10 @@ class MappingServer(Node):
     #self.mode_text_visualizer = ModeTextVisualizer(get_clock=self.get_clock, mode_text_publisher = self.mode_text_publisher, node=self)
 
     self.viewpoint_publisher = self.create_publisher(PointCloud2, "/frontier_viewpoints", 10)
+
+    # Visualizes the frontier selection boundary (in the odom/map frame) so it
+    # can be overlaid with /robot_1/global_plan in RViz.
+    self.boundary_publisher = self.create_publisher(Marker, "/frontier_boundary", 10)
 
     self.publisher_dict = {'path': self.path_publisher, 'voxel_bbox': self.voxel_bbox_publisher, 'viewpoint': self.viewpoint_publisher, 'filtered_rays': self.filtered_rays_publisher}
 
@@ -334,6 +400,17 @@ class MappingServer(Node):
       pose_4x4_np = pose_4x4.cpu().numpy()
       cur_pose_np = np.array([float(pose_4x4_np[0][2,3]), float(-pose_4x4_np[0][0,3]), float(-pose_4x4_np[0][1,3])])
 
+      # cur_pose_np is the robot position in the local/odom (ENU-at-home) frame.
+      # Pair it with the latest GPS fix to estimate/lock the origin of that
+      # frame ("home"), which fixes the local->frontier-mapping-frame transform.
+      if self._latest_gps is not None and not self.geo_frame.home_fixed:
+        self.geo_frame.update_home(
+          self._latest_gps.latitude, self._latest_gps.longitude,
+          self._latest_gps.altitude, cur_pose_np)
+
+      # Overlay the frontier selection boundary in the map frame for RViz.
+      self.publish_frontier_boundary()
+
       kwargs = dict()
       if "confidence_map" in batch.keys():
         kwargs["conf_map"] = batch["confidence_map"].cuda()
@@ -464,7 +541,7 @@ class MappingServer(Node):
       self.status = MappingServer.Status.CLOSED
 
   def target_object_callback(self, msg):
-    targets = [t.strip().lower() for t in msg.daa.split(",") if t.strip()]
+    targets = [t.strip().lower() for t in msg.data.split(",") if t.strip()]
     if not targets:
       self._target_objects = []
     else:
@@ -473,6 +550,73 @@ class MappingServer(Node):
       if target not in self._queries_labels['text']:
         self.add_queries(target)
   
+  def gps_callback(self, msg):
+    self._latest_gps = msg
+
+  def publish_frontier_boundary(self, z_disp=8.0):
+    """Publish the frontier selection box as a LINE_STRIP Marker.
+
+    The box is defined in the frontier frame; here the 4 corners are
+    transformed back into the local/odom frame so the marker overlays with
+    /robot_1/global_plan (frame_id 'map'). Drawn at z=z_disp (goal height).
+    No-op until the frame's home has been estimated.
+    """
+    if not self.geo_frame.is_ready():
+      return
+    corners_frame = [
+      (self.map_min_x, self.map_min_y),
+      (self.map_max_x, self.map_min_y),
+      (self.map_max_x, self.map_max_y),
+      (self.map_min_x, self.map_max_y),
+      (self.map_min_x, self.map_min_y),  # close the loop
+    ]
+    marker = Marker()
+    marker.header.frame_id = "map"
+    marker.header.stamp = self.get_clock().now().to_msg()
+    marker.ns = "frontier_boundary"
+    marker.id = 0
+    marker.type = Marker.LINE_STRIP
+    marker.action = Marker.ADD
+    marker.scale.x = 0.3  # line width (m)
+    marker.color.r = 1.0
+    marker.color.g = 0.0
+    marker.color.b = 0.0
+    marker.color.a = 1.0
+    marker.pose.orientation.w = 1.0
+    for fx, fy in corners_frame:
+      local = self.geo_frame.frame_to_local(np.array([fx, fy, 0.0]))
+      p = Point()
+      p.x = float(local[0])
+      p.y = float(local[1])
+      p.z = float(z_disp)
+      marker.points.append(p)
+    self.boundary_publisher.publish(marker)
+
+    # Keepout zones as orange closed loops (ids 1..N on the same topic).
+    for i, poly in enumerate(self.keepout_polygons):
+      km = Marker()
+      km.header.frame_id = "map"
+      km.header.stamp = self.get_clock().now().to_msg()
+      km.ns = "frontier_boundary"
+      km.id = 1 + i
+      km.type = Marker.LINE_STRIP
+      km.action = Marker.ADD
+      km.scale.x = 0.3
+      km.color.r = 1.0
+      km.color.g = 0.5
+      km.color.b = 0.0
+      km.color.a = 1.0
+      km.pose.orientation.w = 1.0
+      closed = np.vstack([poly, poly[:1]])
+      for fx, fy in closed:
+        local = self.geo_frame.frame_to_local(np.array([fx, fy, 0.0]))
+        p = Point()
+        p.x = float(local[0])
+        p.y = float(local[1])
+        p.z = float(z_disp)
+        km.points.append(p)
+      self.boundary_publisher.publish(km)
+
   def mode_switch_trigger(self):
     self.waypoint_locked = False
     self.target_waypoint = None
@@ -490,32 +634,6 @@ class MappingServer(Node):
         clear_marker.action = Marker.DELETE
         clear_marker_array.markers.append(clear_marker)
       self.filtered_rays_publisher.publish(clear_marker_array)
-  
-  def create_colored_pointcloud_msg(self, xyz_tensor, rgb_tensor):
-    xyz = xyz_tensor.cpu().numpy()
-    rgb = (rgb_tensor*255).cpu().numpy()
-    assert xyz.shape[0] == rgb.shape[0]
-
-    def pack_rgb(r,g,b):
-      rgb_int = (int(r) << 16) | (int(g) << 8) | int(b)
-      return struct.unpack('f', struct.pack('I', rgb_int))[0]
-    
-    points = []
-    for i in range(xyz.shape[0]):
-      xo,yo,zo = xyz[i]
-      x,y,z = zo,-xo,-yo
-      r,g,b = rgb[i]
-      rgb_packed= pack_rgb(r,g,b)
-      points.append([x,y,z,rgb_packed])
-    
-    fields = [PointField(name='x',offset=0,datatype=PointField.FLOAT32, count=1), 
-              PointField(name='y',offset=4,datatype=PointField.FLOAT32, count=1), 
-              PointField(name='z',offset=8,datatype=PointField.FLOAT32, count=1), 
-              PointField(name='rgb',offset=12,datatype=PointField.FLOAT32, count=1)]
-    header = Header()
-    header.stamp = self.get_clock().now().to_msg()
-    header.frame_id = 'map'
-    return point_cloud2.create_cloud(header, fields, points)
   
   def create_colored_pointcloud_msg(self, xyz_tensor, rgb_tensor):
     xyz = xyz_tensor.cpu().numpy()
