@@ -32,6 +32,7 @@ import math
 import signal
 import threading
 import time
+from collections import deque
 from functools import partial
 
 import torch
@@ -39,6 +40,7 @@ import numpy as np
 import hydra
 
 from rayfronts import geometry3d as g3d
+from rayfronts.geo_frame import FrontierFrame
 from rayfronts.mapping_server import MappingServer, signal_handler
 # rayfronts_cpp is imported (with its build path setup) by the mapper module.
 from rayfronts.mapping.semantic_ray_frontiers_map import rayfronts_cpp
@@ -55,6 +57,11 @@ try:
   from scipy.ndimage import label as scipy_label
 except ModuleNotFoundError:
   scipy_label = None
+
+try:
+  from vision_msgs.msg import Detection2DArray
+except ModuleNotFoundError:
+  Detection2DArray = None
 
 logger = logging.getLogger(__name__)
 
@@ -145,15 +152,18 @@ class ExplorationPlanner:
     self.obstacle_min_frac = float(cfg.obstacle_min_frac)
     self._grid_last_seq = 0
 
-    # Exploration xy bounds (pose-topic world frame) -> world-RDF AABB.
-    # Restricts class-frontier generation (installed on the mapper) and the
-    # info grid votes. None = unbounded.
-    self.bounds_rdf = self._compute_bounds_rdf(cfg)
+    # Grid frame: the 2D frame in which all planar bookkeeping happens
+    # (info grid cell keys, region segmentation, exploration bounds).
+    # Without a configured frontier frame this is the legacy world-RDF
+    # (x, z) plane with bounds from xmin/xmax/ymin/ymax; with one, it is
+    # the mission-level global frame shared with the high-flying drone
+    # (map cells align across robots) with bounds from ff_map_*.
+    # Sets _grid_R/_grid_t (rdf (x,z) -> grid xy), grid_bounds
+    # (min_x, max_x, min_y, max_y in grid xy) and bounds_rdf (RDF AABB
+    # superset for the mapper's class-frontier generation).
+    self._setup_grid_frame(cfg)
     if self.bounds_rdf is not None:
       self.mapper.class_frontier_bounds = self.bounds_rdf
-      logger.info(
-        "Exploration bounds active: x [%s, %s], y [%s, %s] (pose frame).",
-        cfg.xmin, cfg.xmax, cfg.ymin, cfg.ymax)
     # Blacklist keys are rounded to the frontier cluster grid so recomputed
     # frontiers at the same location stay removed. Bans expire with
     # exponential backoff (ban = base * 2^(fails-1), capped) so a frontier
@@ -170,8 +180,9 @@ class ExplorationPlanner:
     # semantically unexplored space (info-grid cells never classified)
     # inside the xy bounds into connected components, commit to the nearest
     # one, approach it via the frontier closest to its centroid, then
-    # exhaust its frontiers before moving on. See _region_plan for the
-    # state machine.
+    # exhaust its frontiers before moving on. Region tasks compete with
+    # person-track revisit tasks under a MAIPP-greedy score. See _task_plan
+    # for the state machine.
     self.region_mode = bool(cfg.get("region_mode", False))
     self.region_min_area_m2 = float(cfg.get("region_min_area_m2", 1.0))
     self.region_max_area_m2 = float(cfg.get("region_max_area_m2", 25.0))
@@ -180,16 +191,61 @@ class ExplorationPlanner:
     self.region_time_budget_s = float(cfg.get("region_time_budget_s", 180.0))
     self.region_retire_cooldown_s = float(
       cfg.get("region_retire_cooldown_s", 180.0))
-    self._region = None   # dict(cells, centroid, t_start)
+    self._task = None  # committed task: dict with type "region" | "track"
+    # MAIPP-style greedy task selection (see _score_tasks / default.yaml).
+    self.target_birth_density = float(cfg.get("target_birth_density", 0.01))
+    self.task_w_mass = float(cfg.get("task_w_mass", 1.0))
+    self.task_w_prob = float(cfg.get("task_w_prob", 0.5))
+    self.task_w_exist = float(cfg.get("task_w_exist", 1.0))
+    self.task_w_cov = float(cfg.get("task_w_cov", 0.2))
+    self.task_w_stale = float(cfg.get("task_w_stale", 0.005))
+    self.task_w_travel = float(cfg.get("task_w_travel", 0.05))
+    self.track_task_min_existence = float(
+      cfg.get("track_task_min_existence", 0.3))
+    self.track_task_min_sigma = float(cfg.get("track_task_min_sigma", 0.8))
+    self.track_task_time_budget_s = float(
+      cfg.get("track_task_time_budget_s", 60.0))
     self._retired = {}    # cell (i, j) -> retirement expiry walltime
-    if self.region_mode and self.bounds_rdf is None:
-      logger.warning("region_mode requires exploration xy bounds "
-                     "(xmin/xmax/ymin/ymax); falling back to global mode.")
+    if self.region_mode and self.grid_bounds is None:
+      logger.warning("region_mode requires bounds (xmin/xmax/ymin/ymax or a "
+                     "frontier frame with ff_map_*); falling back to global "
+                     "mode.")
       self.region_mode = False
     if self.region_mode and scipy_label is None:
       logger.warning("region_mode requires scipy.ndimage; falling back to "
                      "global mode.")
       self.region_mode = False
+
+    # People detections (vision_msgs/Detection2DArray on detection_topic):
+    # the bottom-center of each person bbox is undistorted, cast through the
+    # camera pose at the detection stamp, and intersected with the ground
+    # plane; hits within person_merge_radius of a tracked person update it,
+    # otherwise a new person is created. Visualized on exploration/people.
+    self.detection_topic = cfg.get("detection_topic", None)
+    self.person_class_id = str(cfg.get("person_class_id", "person"))
+    self.person_min_score = float(cfg.get("person_min_score", 0.5))
+    self.person_merge_radius = float(cfg.get("person_merge_radius", 1.0))
+    self.detection_max_range = float(cfg.get("detection_max_range", 12.0))
+    self.detection_max_pose_dt = float(cfg.get("detection_max_pose_dt", 0.5))
+    self.person_negative_min_interval_s = float(
+      cfg.get("person_negative_min_interval_s", 0.5))
+    # Bernoulli-Kalman track parameters (see configs/default.yaml).
+    self.person_p_detect = float(cfg.get("person_p_detect", 0.6))
+    self.person_exist_remove = float(cfg.get("person_exist_remove", 0.2))
+    self.person_exist_confirm = float(cfg.get("person_exist_confirm", 0.8))
+    self.person_process_noise = float(cfg.get("person_process_noise", 0.02))
+    self.person_meas_noise_base = float(
+      cfg.get("person_meas_noise_base", 0.3))
+    self.person_meas_noise_per_m = float(
+      cfg.get("person_meas_noise_per_m", 0.05))
+    self.person_gate_chi2 = float(cfg.get("person_gate_chi2", 9.21))
+    # Tracks: dicts with track_id, pos (3,), cov (2x2 over frame-plane x/z),
+    # existence, status, n_obs, last_seen, score, last_neg_stamp.
+    self.people = []
+    self._next_track_id = 1
+    self._people_prev_predict = time.time()
+    self._det_queue = deque(maxlen=200)
+    self._det_lock = threading.Lock()
 
     # Precompute safety-sphere offsets at voxel resolution.
     n = max(1, int(math.ceil(self.safety_radius / self.vox_size)))
@@ -240,6 +296,20 @@ class ExplorationPlanner:
       ds._rosnode.create_subscription(
         Int8, str(cfg.get("goal_publish_allow_topic", "/goal_publish_allow")),
         self._on_goal_publish_allow, 10)
+      if self.detection_topic:
+        if Detection2DArray is None:
+          logger.warning("vision_msgs not importable; people detection on %s "
+                         "disabled (apt install ros-humble-vision-msgs).",
+                         self.detection_topic)
+          self.detection_topic = None
+        else:
+          ds._rosnode.create_subscription(
+            Detection2DArray, str(self.detection_topic),
+            self._on_detections, 10)
+          logger.info(
+            "People detections on %s (class '%s', min score %.2f, merge "
+            "radius %.1fm).", self.detection_topic, self.person_class_id,
+            self.person_min_score, self.person_merge_radius)
       logger.info("Exploration goal publisher on %s (Pose, NED frame); "
                   "listening for reach status on %s; goal publishing "
                   "enable switch on %s.", cfg.goal_topic,
@@ -260,46 +330,146 @@ class ExplorationPlanner:
     fy = float(K[1, 1])
     return math.degrees(math.atan2(h / 2.0, fy))
 
-  def _compute_bounds_rdf(self, cfg):
-    """Converts pose-frame xy bounds into a world-RDF (min, max) AABB.
+  def _setup_grid_frame(self, cfg):
+    """Establishes the planar grid frame, its bounds, and the RDF AABB.
 
-    Bounds are axis-aligned in the pose-topic world frame (e.g. PX4 NED);
-    the src->RDF conversion is a pure axis permutation, so the box stays
-    axis-aligned. The vertical axis is left unbounded. Returns None when no
-    bound is set.
+    Legacy mode (no ff_origin_lat): grid xy = world-RDF (x, z); bounds come
+    from xmin/xmax/ymin/ymax given in the pose-topic (NED) frame, so
+    grid_bounds = (ymin, ymax, xmin, xmax) — RDF x is NED y and RDF z is
+    NED x.
+
+    Frontier-frame mode (ff_origin_lat + ned_origin_lat set): grid xy is
+    the mission-level global frame shared with the high-flying drone (ENU
+    at ff_origin_lat/lon rotated ff_heading_deg CCW from East). The local
+    NED odometry frame is georeferenced by ned_origin_lat/lon/alt (global
+    position of the local origin) and ned_heading_deg (compass azimuth,
+    degrees clockwise from TRUE north, of the local NED +x axis — the
+    drone's initialization heading). Bounds come from ff_map_min/max_x/y.
+
+    Sets: _grid_R (2x2), _grid_t, _grid_R_inv, frame_active, grid_bounds
+    (min_x, max_x, min_y, max_y in grid xy or None), bounds_rdf (RDF AABB
+    enclosing the bounds box, for the mapper's class-frontier generation).
     """
-    vals = [cfg.get("xmin", None), cfg.get("xmax", None),
-            cfg.get("ymin", None), cfg.get("ymax", None)]
-    if all(v is None for v in vals):
-      return None
-    big = 1e6
-    xmin = float(vals[0]) if vals[0] is not None else -big
-    xmax = float(vals[1]) if vals[1] is not None else big
-    ymin = float(vals[2]) if vals[2] is not None else -big
-    ymax = float(vals[3]) if vals[3] is not None else big
+    self._grid_R = torch.eye(2, dtype=torch.float)
+    self._grid_t = torch.zeros(2, dtype=torch.float)
+    self.frame_active = False
+    self.grid_bounds = None
+    self.bounds_rdf = None
 
-    ds = getattr(self.server, "dataset", None)
-    if ds is not None and hasattr(ds, "src2rdf"):
-      R = ds.src2rdf[:3, :3]
+    ff_lat = cfg.get("ff_origin_lat", None)
+    ned_lat = cfg.get("ned_origin_lat", None)
+    if ff_lat is not None and ned_lat is None:
+      logger.warning(
+        "Frontier frame configured (ff_origin_lat) but the local NED "
+        "georeference (ned_origin_lat/lon/heading) is missing; falling "
+        "back to local bounds.")
+      ff_lat = None
+
+    if ff_lat is not None:
+      ff = FrontierFrame(
+        origin_lat=float(ff_lat),
+        origin_lon=float(cfg.ff_origin_lon),
+        origin_alt=float(cfg.get("ff_origin_alt", 0.0)),
+        heading_deg=float(cfg.get("ff_heading_deg", 0.0)))
+      ff.set_home(float(ned_lat), float(cfg.ned_origin_lon),
+                  float(cfg.get("ned_origin_alt", 0.0)))
+      # Local NED -> ENU at the local origin: +x points at compass azimuth
+      # psi (CW from true north), +y is 90deg right of it, +z is down.
+      psi = math.radians(float(cfg.get("ned_heading_deg", 0.0)))
+      r_n2e = np.array([[math.sin(psi), math.cos(psi), 0.0],
+                        [math.cos(psi), -math.sin(psi), 0.0],
+                        [0.0, 0.0, -1.0]])
+      # Full chain NED -> frame; ENU@home -> frame is affine (geo_frame).
+      m = ff._affine_R @ r_n2e
+      # Planar 2x2 on RDF (x, z): rdf x = ned y, rdf z = ned x. The dropped
+      # altitude column contributes < 1e-4 m/m horizontally at mission
+      # scale (< 1 km).
+      self._grid_R = torch.tensor(
+        [[m[0, 1], m[0, 0]], [m[1, 1], m[1, 0]]], dtype=torch.float)
+      self._grid_t = torch.tensor(
+        [float(ff._affine_t[0]), float(ff._affine_t[1])],
+        dtype=torch.float)
+      self.frame_active = True
+      self.grid_bounds = (float(cfg.ff_map_min_x), float(cfg.ff_map_max_x),
+                          float(cfg.ff_map_min_y), float(cfg.ff_map_max_y))
+      logger.info(
+        "Frontier frame active: origin (%.6f, %.6f) heading %.2fdeg; local "
+        "NED origin (%.6f, %.6f) heading %.2fdeg sits at frame (%.1f, %.1f)"
+        "; map bounds x [%.1f, %.1f], y [%.1f, %.1f].",
+        ff.origin_lat, ff.origin_lon, ff.heading_deg, float(ned_lat),
+        float(cfg.ned_origin_lon), float(cfg.get("ned_heading_deg", 0.0)),
+        float(self._grid_t[0]), float(self._grid_t[1]), *self.grid_bounds)
     else:
-      logger.warning("Exploration bounds: no dataset src2rdf available; "
-                     "assuming bounds are already in world RDF.")
-      R = torch.eye(3)
-    # Transform the 8 corners (z unbounded) and take the axis-aligned hull.
-    corners = torch.tensor(
-      [[x, y, z] for x in (xmin, xmax) for y in (ymin, ymax)
-       for z in (-big, big)], dtype=torch.float)
-    corners = corners @ R.T
-    return corners.min(dim=0).values, corners.max(dim=0).values
+      # Legacy: bounds in the pose-topic (NED) frame; grid xy = RDF (x, z).
+      vals = [cfg.get("xmin", None), cfg.get("xmax", None),
+              cfg.get("ymin", None), cfg.get("ymax", None)]
+      if not all(v is None for v in vals):
+        big = 1e6
+        xmin = float(vals[0]) if vals[0] is not None else -big
+        xmax = float(vals[1]) if vals[1] is not None else big
+        ymin = float(vals[2]) if vals[2] is not None else -big
+        ymax = float(vals[3]) if vals[3] is not None else big
+        ds = getattr(self.server, "dataset", None)
+        if ds is not None and hasattr(ds, "src2rdf"):
+          R = ds.src2rdf[:3, :3]
+        else:
+          logger.warning("Exploration bounds: no dataset src2rdf available; "
+                         "assuming bounds are already in world RDF.")
+          R = torch.eye(3)
+        # Transform the box corners through the (axis permutation) src->RDF
+        # and read the grid (RDF x, z) ranges off the hull.
+        corners = torch.tensor(
+          [[x, y, z] for x in (xmin, xmax) for y in (ymin, ymax)
+           for z in (-big, big)], dtype=torch.float)
+        corners = corners @ R.T
+        self.grid_bounds = (float(corners[:, 0].min()),
+                            float(corners[:, 0].max()),
+                            float(corners[:, 2].min()),
+                            float(corners[:, 2].max()))
+        logger.info(
+          "Exploration bounds active: x [%s, %s], y [%s, %s] (pose frame).",
+          *vals)
+
+    self._grid_R_inv = torch.linalg.inv(self._grid_R)
+    if self.grid_bounds is not None:
+      # RDF AABB enclosing the (possibly rotated) bounds box, y unbounded.
+      mnx, mxx, mny, mxy = self.grid_bounds
+      corners = torch.tensor([[x, y] for x in (mnx, mxx) for y in (mny, mxy)],
+                             dtype=torch.float)
+      c_rdf = (corners - self._grid_t) @ self._grid_R_inv.T  # (x_rdf, z_rdf)
+      big = 1e6
+      self.bounds_rdf = (
+        torch.tensor([float(c_rdf[:, 0].min()), -big,
+                      float(c_rdf[:, 1].min())]),
+        torch.tensor([float(c_rdf[:, 0].max()), big,
+                      float(c_rdf[:, 1].max())]))
+
+  def _grid_xy(self, pts):
+    """World-RDF points (Nx3) -> grid-frame xy (Nx2)."""
+    return pts[:, [0, 2]] @ self._grid_R.T + self._grid_t
+
+  def _grid_xy_to_rdf(self, xy, y):
+    """Grid-frame xy (Nx2) -> world-RDF points (Nx3) at height y."""
+    xz = (xy - self._grid_t) @ self._grid_R_inv.T
+    out = torch.empty((xy.shape[0], 3), dtype=torch.float)
+    out[:, 0] = xz[:, 0]
+    out[:, 1] = y
+    out[:, 2] = xz[:, 1]
+    return out
 
   def _in_bounds_mask(self, pts):
-    """Boolean mask of points inside the RDF bounds (all True if unbounded)."""
-    if self.bounds_rdf is None:
+    """Boolean mask of RDF points inside the grid-frame bounds box.
+
+    Exact test in grid xy (the box may be rotated in RDF); all True when
+    unbounded.
+    """
+    if self.grid_bounds is None:
       return torch.ones(pts.shape[0], dtype=torch.bool, device=pts.device)
-    mn, mx = self.bounds_rdf
-    mn = mn.to(pts.device).reshape(1, 3)
-    mx = mx.to(pts.device).reshape(1, 3)
-    return ((pts >= mn) & (pts <= mx)).all(dim=-1)
+    xy = self._grid_xy(pts.cpu())
+    mnx, mxx, mny, mxy = self.grid_bounds
+    mask = ((xy[:, 0] >= mnx) & (xy[:, 0] <= mxx) &
+            (xy[:, 1] >= mny) & (xy[:, 1] <= mxy))
+    return mask.to(pts.device)
 
   # ---------- lifecycle ----------
 
@@ -321,6 +491,10 @@ class ExplorationPlanner:
     # running encoder modules on them from this thread without it would
     # attempt to record autograd state and fail.
     while not self._stop.is_set():
+      try:
+        self._update_people()
+      except Exception:
+        logger.exception("People update failed.")
       try:
         self._update_info_grid()
       except Exception:
@@ -365,22 +539,294 @@ class ExplorationPlanner:
     entry = self._blacklist.get(key)
     return entry is not None and time.time() < entry[1]
 
+  # ---------- people detection ----------
+
+  def _on_detections(self, msg):
+    """ROS callback: queue person bbox bottom-centers for projection.
+
+    Runs on the ROS executor thread; projection happens on the planner
+    thread (_update_people) where map/pose access is already organized.
+    """
+    stamp_ns = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
+    dets = []
+    for det in msg.detections:
+      best_score = 0.0
+      for r in det.results:
+        if (str(r.hypothesis.class_id) == self.person_class_id and
+            float(r.hypothesis.score) > best_score):
+          best_score = float(r.hypothesis.score)
+      if best_score < self.person_min_score:
+        continue
+      u = float(det.bbox.center.position.x)
+      v = float(det.bbox.center.position.y) + 0.5 * float(det.bbox.size_y)
+      dets.append((u, v, best_score))
+    # Empty frames are queued too: they are the negative evidence that
+    # removes stale people (see _negative_pass).
+    with self._det_lock:
+      self._det_queue.append((stamp_ns, dets))
+
+  def _lookup_body_pose_rdf(self, stamp_ns):
+    """Body pose (4x4 world RDF) nearest to stamp_ns and its |dt| seconds."""
+    ds = self.server.dataset
+    with ds._pose_lock:
+      buf = list(ds._pose_buf)
+    if len(buf) == 0:
+      return None
+    diffs = [abs(t - stamp_ns) for t, _ in buf]
+    i = diffs.index(min(diffs))
+    pose = torch.tensor(buf[i][1], dtype=torch.float)
+    return g3d.transform_pose_4x4(pose, ds.src2rdf), diffs[i] / 1e9
+
+  def _update_people(self):
+    """Projects queued detections to ground and merges them into people.
+
+    Bottom-center pixels are undistorted with the dataset's raw (scaled)
+    RGB calibration — detections are assumed to be in the pixel space of
+    the same rgb_topic images RayFronts receives — cast through the camera
+    pose at the (clock-corrected) detection stamp, and intersected with the
+    ground plane at the median ground-class voxel height.
+    """
+    if not self.detection_topic:
+      return
+    with self._det_lock:
+      batches = list(self._det_queue)
+      self._det_queue.clear()
+    if len(batches) == 0:
+      return
+    ds = self.server.dataset
+    K = getattr(ds, "_rgb_K_orig", None)
+    dist = getattr(ds, "_rgb_dist_coeffs", None)
+    if K is None:
+      return  # no RGB frame processed yet; calibration space unknown
+    with self.server.map_lock:
+      cls = self.mapper.class_voxels_xyz
+      gy = (float(cls[:, 1].median())
+            if cls is not None and cls.shape[0] > 0 else None)
+    if gy is None:
+      return  # no classified ground yet to intersect with
+    import cv2
+    # Kalman predict: static-target model, so covariance grows with time
+    # while a person goes unobserved (quantifies revisit value / widens the
+    # association gate for stale tracks).
+    now = time.time()
+    dt = max(0.0, now - self._people_prev_predict)
+    self._people_prev_predict = now
+    if dt > 0.0:
+      q = self.person_process_noise * dt
+      for person in self.people:
+        person["cov"] = person["cov"] + q * torch.eye(2)
+
+    stamp_off = getattr(ds, "_rgb_stamp_offset_ns", 0)
+    changed = False
+    for stamp_ns, dets in batches:
+      r = self._lookup_body_pose_rdf(stamp_ns + stamp_off)
+      if r is None or r[1] > self.detection_max_pose_dt:
+        continue
+      T_wc = r[0] @ ds.T_body_rgb
+      rot, cam_pos = T_wc[:3, :3], T_wc[:3, 3]
+      matched = set()
+      for u, v, score in dets:
+        pix = np.array([[[u, v]]], dtype=np.float32)
+        n = cv2.undistortPoints(pix, np.asarray(K, dtype=np.float64), dist)
+        ray = rot @ torch.tensor(
+          [float(n[0, 0, 0]), float(n[0, 0, 1]), 1.0])
+        if float(ray[1]) < 1e-3:
+          continue  # at/above the horizon; no ground intersection ahead
+        t = (gy - float(cam_pos[1])) / float(ray[1])
+        if t <= 0:
+          continue
+        w = cam_pos + t * ray
+        rng = math.hypot(float(w[0] - cam_pos[0]), float(w[2] - cam_pos[2]))
+        if rng > self.detection_max_range:
+          continue  # grazing ray; too unreliable
+        w[1] = gy
+        # Far/grazing projections carry more ground error; trust them less.
+        sigma = self.person_meas_noise_base + self.person_meas_noise_per_m * rng
+        matched.add(self._associate_detection(w, score, sigma))
+        changed = True
+      if len(self.people) > 0:
+        changed |= self._negative_pass(rot, cam_pos, K, matched, stamp_ns)
+    if changed:
+      self._vis_people()
+
+  def _person_status(self, person):
+    """Track lifecycle label from existence probability."""
+    if (person["existence"] >= self.person_exist_confirm and
+        person["n_obs"] >= 2):
+      return "confirmed"
+    if person["existence"] < 0.35:
+      return "stale"
+    return "candidate"
+
+  def _associate_detection(self, pos, score, meas_sigma):
+    """Bernoulli-KF association/update for one projected detection.
+
+    Associates to the track with the smallest Mahalanobis distance within
+    person_gate_chi2 (person_merge_radius as a euclidean floor), then
+    Kalman-updates its mean/covariance and raises its existence. Unmatched
+    detections give birth to a new track (existence seeded from the
+    detector score). Returns the track's index.
+    """
+    now = time.time()
+    z = torch.tensor([float(pos[0]), float(pos[2])])
+    R = (meas_sigma ** 2) * torch.eye(2)
+    best, best_d2 = None, None
+    for i, person in enumerate(self.people):
+      mu = torch.tensor([float(person["pos"][0]), float(person["pos"][2])])
+      innov = z - mu
+      S = person["cov"] + R
+      d2 = float(innov @ torch.linalg.solve(S, innov))
+      if (d2 <= self.person_gate_chi2 or
+          float(innov.norm()) <= self.person_merge_radius):
+        if best is None or d2 < best_d2:
+          best, best_d2 = i, d2
+    if best is not None:
+      person = self.people[best]
+      mu = torch.tensor([float(person["pos"][0]), float(person["pos"][2])])
+      innov = z - mu
+      S = person["cov"] + R
+      gain = person["cov"] @ torch.linalg.inv(S)
+      new_mu = mu + gain @ innov
+      person["pos"] = torch.tensor(
+        [float(new_mu[0]), float(pos[1]), float(new_mu[1])])
+      person["cov"] = (torch.eye(2) - gain) @ person["cov"]
+      pd = self.person_p_detect
+      person["existence"] = min(
+        1.0, 1.0 - (1.0 - person["existence"]) * (1.0 - pd))
+      person["n_obs"] += 1
+      person["last_seen"] = now
+      person["score"] = max(person["score"], score)
+      person["status"] = self._person_status(person)
+      return best
+    # Birth: existence seeded from detector confidence; covariance from the
+    # measurement noise plus a placement margin.
+    self.people.append(dict(
+      track_id=self._next_track_id,
+      pos=pos.clone(),
+      cov=R + 0.25 * torch.eye(2),
+      existence=min(0.9, max(0.4, score)),
+      status="candidate",
+      n_obs=1, last_seen=now, score=score, last_neg_stamp=-10**18))
+    logger.info(
+      "Person track #%d born at (%.1f, %.1f), score %.2f, existence %.2f.",
+      self._next_track_id, float(pos[0]), float(pos[2]), score,
+      self.people[-1]["existence"])
+    self._next_track_id += 1
+    return len(self.people) - 1
+
+  def _negative_pass(self, rot, cam_pos, K, matched, stamp_ns):
+    """Counts missed observations for people the frame should have seen.
+
+    A tracked person not matched by any detection in this frame accrues a
+    negative observation only when the detector genuinely should have seen
+    them: BOTH a low body point (0.3m above ground — a person may be lying
+    down) AND the mid-body point (0.9m) project well inside the image (10%
+    border margin), lie in front of the camera within detection_max_range,
+    and have occlusion-free lines of sight. Low cover that could hide a
+    lying person (tall grass, rocks, ridges) therefore pauses the countdown
+    rather than counting against them. Negatives are rate-limited to one
+    per person_negative_min_interval_s of message time (detectors flicker
+    frame to frame). Each counted miss lowers the track's existence via the
+    Bernoulli missed-detection update r <- r(1-p_d)/(1-r*p_d); dropping
+    below person_exist_remove deletes the track. Positive matches raise
+    existence back up (see _associate_detection).
+    """
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    # Approximate frame size from the (near-centered) principal point.
+    W, H = 2.0 * cx, 2.0 * cy
+    min_gap_ns = int(self.person_negative_min_interval_s * 1e9)
+    check_heights = (0.3, 0.9)  # lying-body and standing mid-body points
+    changed = False
+    keep = []
+    for i, person in enumerate(self.people):
+      if i in matched:
+        keep.append(person)
+        continue
+      should_see = True
+      for h in check_heights:
+        pt = person["pos"] + torch.tensor([0.0, -h, 0.0])
+        pc = rot.T @ (pt - cam_pos)
+        z = float(pc[2])
+        if z <= 1.0:
+          should_see = False
+          break
+        u = fx * float(pc[0]) / z + cx
+        v = fy * float(pc[1]) / z + cy
+        if not (0.1 * W < u < 0.9 * W and 0.1 * H < v < 0.9 * H and
+                math.hypot(float(pt[0] - cam_pos[0]),
+                           float(pt[2] - cam_pos[2]))
+                <= self.detection_max_range):
+          should_see = False
+          break
+        if not self._los_clear(cam_pos, pt):
+          should_see = False
+          break
+      gap = stamp_ns - person["last_neg_stamp"]
+      rate_ok = gap >= min_gap_ns or gap < -5 * 10**9  # bag-loop wrap
+      if should_see and rate_ok:
+        pd = self.person_p_detect
+        r = person["existence"]
+        denom = 1.0 - r * pd
+        person["existence"] = (0.0 if denom <= 1e-9
+                               else r * (1.0 - pd) / denom)
+        person["last_neg_stamp"] = stamp_ns
+        person["status"] = self._person_status(person)
+        changed = True
+        if person["existence"] < self.person_exist_remove:
+          logger.info(
+            "Person track #%d at (%.1f, %.1f) removed (existence %.2f "
+            "after missed observations).", person["track_id"],
+            float(person["pos"][0]), float(person["pos"][2]),
+            person["existence"])
+          continue  # drop from keep list
+      keep.append(person)
+    self.people = keep
+    return changed
+
+  def _vis_people(self):
+    """Rerun overlay: tracked people at ground height.
+
+    Disc radius reflects positional uncertainty (sigma from the covariance
+    trace); color reflects the track lifecycle (confirmed red, candidate
+    orange, stale gray). Logs an empty set too, so removing the last person
+    clears the layer.
+    """
+    vis = getattr(self.server, "vis", None)
+    if vis is None or not hasattr(vis, "log_pc"):
+      return
+    try:
+      n = len(self.people)
+      status_rgb = {"confirmed": [230, 30, 30], "candidate": [255, 150, 40],
+                    "stale": [140, 90, 90]}
+      pts = (torch.stack([p["pos"] for p in self.people]) if n > 0
+             else torch.zeros((0, 3)))
+      colors = torch.tensor(
+        [status_rgb.get(p["status"], [255, 150, 40]) for p in self.people],
+        dtype=torch.uint8).reshape(n, 3)
+      radii = torch.tensor(
+        [min(2.5, 0.25 + math.sqrt(0.5 * float(torch.trace(p["cov"]))))
+         for p in self.people]).reshape(n)
+      vis.log_pc(pts, colors, radii, layer="exploration/people")
+    except Exception:
+      logger.exception("Failed to visualize people.")
+
   # ---------- region-based hierarchical exploration ----------
 
   def _region_grid(self):
     """Info-grid index window covering the bounds.
 
     Returns (ix0, iz0, nx, nz): region cells are the info-grid cells
-    (centers at ix*grid_cell_size, iz*grid_cell_size) whose centers lie
-    inside the exploration bounds; array index (i, j) maps to info-grid key
-    (i + ix0, j + iz0).
+    (centers at ix*grid_cell_size, iz*grid_cell_size in GRID-FRAME xy)
+    whose centers lie inside the grid-frame bounds; array index (i, j)
+    maps to info-grid key (i + ix0, j + iz0).
     """
-    mn, mx = self.bounds_rdf
+    mnx, mxx, mny, mxy = self.grid_bounds
     g = self.grid_cell_size
-    ix0 = int(math.ceil(float(mn[0]) / g))
-    iz0 = int(math.ceil(float(mn[2]) / g))
-    nx = max(1, int(math.floor(float(mx[0]) / g)) - ix0 + 1)
-    nz = max(1, int(math.floor(float(mx[2]) / g)) - iz0 + 1)
+    ix0 = int(math.ceil(mnx / g))
+    iz0 = int(math.ceil(mny / g))
+    nx = max(1, int(math.floor(mxx / g)) - ix0 + 1)
+    nz = max(1, int(math.floor(mxy / g)) - iz0 + 1)
     return ix0, iz0, nx, nz
 
   def _unknown_mask(self):
@@ -442,53 +888,121 @@ class ExplorationPlanner:
             (float(arr[:, 1].mean()) + iz0) * g)
 
   def _frontier_region_mask(self, frontiers, cells):
-    """Boolean mask of frontiers whose (x, z) cell belongs to `cells`."""
+    """Boolean mask of frontiers whose grid-frame cell belongs to `cells`."""
     ix0, iz0, _, _ = self._region_grid()
     g = self.grid_cell_size
-    i = torch.round(frontiers[:, 0] / g).long() - ix0
-    j = torch.round(frontiers[:, 2] / g).long() - iz0
+    xy = self._grid_xy(frontiers)
+    i = torch.round(xy[:, 0] / g).long() - ix0
+    j = torch.round(xy[:, 1] / g).long() - iz0
     return torch.tensor(
       [(int(a), int(b)) in cells for a, b in zip(i.tolist(), j.tolist())],
       dtype=torch.bool)
 
-  def _retire_region(self, reason):
-    expiry = time.time() + self.region_retire_cooldown_s
-    for c in self._region["cells"]:
-      self._retired[c] = expiry
-    logger.info(
-      "Region at (%.1f, %.1f) done: %s (%d cells, %.0fs cooldown).",
-      *self._region["centroid"], reason, len(self._region["cells"]),
-      self.region_retire_cooldown_s)
-    self._region = None
+  def _finish_task(self, reason):
+    """Completes the committed task; region cells go on cooldown."""
+    t = self._task
+    if t["type"] == "region":
+      expiry = time.time() + self.region_retire_cooldown_s
+      for c in t["cells"]:
+        self._retired[c] = expiry
+      logger.info(
+        "Region task at (%.1f, %.1f) done: %s (%d cells, %.0fs cooldown).",
+        *t["centroid"], reason, len(t["cells"]),
+        self.region_retire_cooldown_s)
+    else:
+      logger.info("Track task (person #%d) done: %s.",
+                  t["track_id"], reason)
+    self._task = None
 
-  def _region_plan(self, frontiers, robot_pose, class_vox):
-    """Hierarchical layer over frontier selection.
+  def _score_tasks(self, regions, robot_xy):
+    """MAIPP-greedy utilities over region + track candidate tasks.
 
-    Maintains a target subregion of unknown space and returns
-    (frontier_subset, attempt_order) for the viewpoint search:
-    - COVER: the region holds >= region_min_frontiers active frontiers;
-      only those are attempted, ranked by the standard cost.
-    - APPROACH: too few frontiers inside yet; all frontiers are attempted,
-      ordered by distance to the region centroid (robot distance as
-      tiebreak), pulling the map toward the region.
-    - Fallback: no unknown regions remain -> global ranking.
-    A region completes when the classified fraction of its cells reaches
-    region_coverage_done or region_time_budget_s elapses.
+    Region (explore): w_mass * lambda_sum + w_prob * (1 - exp(-lambda_sum))
+      - w_travel * dist, with lambda_sum = target_birth_density * unexplored
+      area (v1 PMB-lite: uniform undetected-target birth prior; no
+      detector-sweep thinning yet).
+    Track (revisit): w_exist * existence + w_cov * trace(P) + w_stale *
+      time_since_seen - w_travel * dist, for tracks worth revisiting
+      (existence >= track_task_min_existence and position sigma >=
+      track_task_min_sigma, i.e. uncertainty actually grew since last seen).
+    Returns (best task dict or None, n_region_cands, n_track_cands).
+    """
+    now = time.time()
+    cands = []
+    cell_area = self.grid_cell_size ** 2
+    for cells in regions:
+      cx, cy = self._region_centroid(cells)
+      dist = math.hypot(cx - robot_xy[0], cy - robot_xy[1])
+      lam = self.target_birth_density * len(cells) * cell_area
+      score = (self.task_w_mass * lam
+               + self.task_w_prob * (1.0 - math.exp(-lam))
+               - self.task_w_travel * dist)
+      cands.append((score, dict(type="region", cells=cells,
+                                centroid=(cx, cy), t_start=now)))
+    n_region = len(cands)
+    for p in self.people:
+      sigma = math.sqrt(0.5 * float(torch.trace(p["cov"])))
+      if (p["existence"] < self.track_task_min_existence or
+          sigma < self.track_task_min_sigma):
+        continue
+      pxy = self._grid_xy(p["pos"].reshape(1, 3))[0]
+      dist = math.hypot(float(pxy[0]) - robot_xy[0],
+                        float(pxy[1]) - robot_xy[1])
+      score = (self.task_w_exist * p["existence"]
+               + self.task_w_cov * float(torch.trace(p["cov"]))
+               + self.task_w_stale * (now - p["last_seen"])
+               - self.task_w_travel * dist)
+      cands.append((score, dict(type="track", track_id=p["track_id"],
+                                t_start=now, start_n_obs=p["n_obs"])))
+    if len(cands) == 0:
+      return None, 0, 0
+    best = max(cands, key=lambda c: c[0])
+    return best[1], n_region, len(cands) - n_region
+
+  def _task_plan(self, frontiers, robot_pose, class_vox):
+    """MAIPP-style task layer over frontier/viewpoint selection.
+
+    Maintains one committed task at a time and returns
+    (targets, attempt_order) for the viewpoint search:
+    - region task (explore): approach via centroid-pulled frontiers, then
+      cover the region's own frontiers; completes when the classified
+      fraction reaches region_coverage_done or region_time_budget_s
+      elapses (cells then cool down for region_retire_cooldown_s).
+    - track task (revisit person): the track mean is returned as a single
+      pseudo-frontier, so the standard viewpoint search finds a safe pose
+      observing the person's location; completes on re-acquisition (a new
+      detection collapsed the covariance below track_task_min_sigma),
+      track removal, or track_task_time_budget_s.
+    Candidates are scored greedily (_score_tasks); falls back to global
+    frontier ranking when no task exists.
     """
     unknown = self._unknown_mask()
     unknown_set = set(map(tuple, np.argwhere(unknown).tolist()))
     robot_pos = robot_pose[:3, 3]
 
-    # Completion checks on the current region.
-    if self._region is not None:
-      cells = self._region["cells"]
+    # Completion checks on the committed task.
+    if self._task is not None and self._task["type"] == "region":
+      cells = self._task["cells"]
       cov = 1.0 - len(cells & unknown_set) / max(len(cells), 1)
-      age = time.time() - self._region["t_start"]
+      age = time.time() - self._task["t_start"]
       if cov >= self.region_coverage_done:
-        self._retire_region("coverage %.0f%% reached" % (cov * 100))
+        self._finish_task("coverage %.0f%% reached" % (cov * 100))
       elif age > self.region_time_budget_s:
-        self._retire_region("time budget exceeded (%.0fs, coverage %.0f%%)"
-                            % (age, cov * 100))
+        self._finish_task("time budget exceeded (%.0fs, coverage %.0f%%)"
+                          % (age, cov * 100))
+    elif self._task is not None:  # track task
+      track = next((p for p in self.people
+                    if p["track_id"] == self._task["track_id"]), None)
+      age = time.time() - self._task["t_start"]
+      if track is None:
+        self._finish_task("track disappeared")
+      elif (track["n_obs"] > self._task["start_n_obs"] and
+            math.sqrt(0.5 * float(torch.trace(track["cov"])))
+            < self.track_task_min_sigma):
+        self._finish_task(
+          "re-acquired (existence %.2f)" % track["existence"])
+      elif age > self.track_task_time_budget_s:
+        self._finish_task("time budget exceeded (%.0fs)" % age)
 
     # Cells retired above (this same cycle) must not be re-selectable.
     if self._retired:
@@ -498,32 +1012,45 @@ class ExplorationPlanner:
           unknown[i, j] = False
       unknown_set -= set(self._retired.keys())
 
-    # Select the nearest incomplete region if none is active.
-    if self._region is None:
+    # Commit to the best-scoring task if none is active.
+    if self._task is None:
       regions = self._segment_unknown(unknown)
-      if len(regions) == 0:
+      robot_xy = self._grid_xy(robot_pos.reshape(1, 3))[0]
+      task, n_r, n_t = self._score_tasks(
+        regions, (float(robot_xy[0]), float(robot_xy[1])))
+      if task is None:
         self._vis_regions(unknown_set, class_vox)
         return frontiers, self.rank_frontiers(robot_pose, frontiers)
-      cents = [self._region_centroid(c) for c in regions]
-      dists = [math.hypot(cx - float(robot_pos[0]), cz - float(robot_pos[2]))
-               for cx, cz in cents]
-      k = int(np.argmin(dists))
-      self._region = dict(cells=regions[k], centroid=cents[k],
-                          t_start=time.time(), seen=False)
-      logger.info(
-        "Region selected: centroid (%.1f, %.1f), %.1f m^2, %.1fm away "
-        "(%d candidate regions).", *cents[k],
-        len(regions[k]) * self.grid_cell_size ** 2, dists[k], len(regions))
+      self._task = task
+      if task["type"] == "region":
+        logger.info(
+          "Task selected: explore region at (%.1f, %.1f), %.1f m^2 "
+          "(%d region / %d track candidates).", *task["centroid"],
+          len(task["cells"]) * self.grid_cell_size ** 2, n_r, n_t)
+      else:
+        logger.info(
+          "Task selected: revisit person track #%d "
+          "(%d region / %d track candidates).", task["track_id"], n_r, n_t)
 
     self._vis_regions(unknown_set, class_vox)
 
-    cells = self._region["cells"]
+    if self._task["type"] == "track":
+      track = next((p for p in self.people
+                    if p["track_id"] == self._task["track_id"]), None)
+      if track is None:
+        return frontiers, self.rank_frontiers(robot_pose, frontiers)
+      # Track mean as a single pseudo-frontier for the viewpoint search.
+      return track["pos"].reshape(1, 3), torch.tensor([0])
+
+    cells = self._task["cells"]
     in_mask = self._frontier_region_mask(frontiers, cells)
     if int(in_mask.sum()) >= self.region_min_frontiers:
       sub = frontiers[in_mask]
       return sub, self.rank_frontiers(robot_pose, sub)
-    cx, cz = self._region["centroid"]
-    d_cent = ((frontiers[:, 0] - cx) ** 2 + (frontiers[:, 2] - cz) ** 2).sqrt()
+    # Approach: pull toward the region centroid (grid-frame coordinates).
+    cx, cy = self._task["centroid"]
+    fxy = self._grid_xy(frontiers)
+    d_cent = ((fxy[:, 0] - cx) ** 2 + (fxy[:, 1] - cy) ** 2).sqrt()
     d_robot = (frontiers - robot_pos.reshape(1, 3)).norm(dim=-1)
     return frontiers, torch.argsort(d_cent + 1e-3 * d_robot)
 
@@ -536,11 +1063,13 @@ class ExplorationPlanner:
       ix0, iz0, _, _ = self._region_grid()
       g = self.grid_cell_size
       gy = float(class_vox[:, 1].median())
-      cur = self._region["cells"] if self._region is not None else set()
+      cur = (self._task["cells"] if self._task is not None and
+             self._task["type"] == "region" else set())
       cells = sorted(unknown_set)
-      pts = torch.tensor(
-        [[(i + ix0) * g, gy, (j + iz0) * g] for i, j in cells],
+      xy = torch.tensor(
+        [[(i + ix0) * g, (j + iz0) * g] for i, j in cells],
         dtype=torch.float)
+      pts = self._grid_xy_to_rdf(xy, gy)
       colors = torch.tensor(
         [[255, 140, 0] if c in cur else [90, 90, 90] for c in cells],
         dtype=torch.uint8)
@@ -805,20 +1334,24 @@ class ExplorationPlanner:
     """
     if pts.shape[0] == 0:
       return
-    ix = torch.round(pts[:, 0] / cell_size).long()
-    iz = torch.round(pts[:, 2] / cell_size).long()
+    now = time.time()
+    xy = self._grid_xy(pts)
+    ix = torch.round(xy[:, 0] / cell_size).long()
+    iz = torch.round(xy[:, 1] / cell_size).long()
     ys = pts[:, 1] if y_vals is None else y_vals
     for k in range(pts.shape[0]):
       key = (int(ix[k]), int(iz[k]))
       cell = self.info_grid.get(key)
       if cell is None:
-        cell = [0, 0.0, float(ys[k]), 0, 0]  # state, conf, y, gnd, obs
+        # state, conf, y, gnd votes, obs votes, last-observed walltime
+        cell = [0, 0.0, float(ys[k]), 0, 0, now]
         self.info_grid[key] = cell
       if state == 2:
         cell[4] += 1
       else:
         cell[3] += 1
       cell[2] = float(ys[k])
+      cell[5] = now
       frac_obs = cell[4] / (cell[3] + cell[4])
       if cell[4] > 0 and frac_obs >= self.obstacle_min_frac:
         cell[0] = 2
@@ -844,8 +1377,9 @@ class ExplorationPlanner:
       if y_plane is None:
         ys = torch.tensor([v[2] for v in vals], dtype=torch.float)
         y_plane = float(ys.median())
-      pts = torch.tensor([[k[0] * g, y_plane, k[1] * g]
-                          for k in keys], dtype=torch.float)
+      xy = torch.tensor([[k[0] * g, k[1] * g] for k in keys],
+                        dtype=torch.float)
+      pts = self._grid_xy_to_rdf(xy, y_plane)
       colors = torch.tensor([[0.2, 0.85, 0.3] if v[0] == 1
                              else [0.95, 0.2, 0.15] for v in vals],
                             dtype=torch.float)
@@ -920,6 +1454,15 @@ class ExplorationPlanner:
       frontiers = frontiers.detach().cpu().clone()
       class_vox = class_vox.detach().cpu().clone()
 
+    # Exact bounds filter: the mapper generates class frontiers in the RDF
+    # AABB *superset* of the (possibly rotated) grid-frame bounds box; drop
+    # anything outside the exact box so no goal is ever selected beyond the
+    # shared map bounds.
+    if self.grid_bounds is not None:
+      frontiers = frontiers[self._in_bounds_mask(frontiers)]
+      if frontiers.shape[0] == 0:
+        return
+
     # Drop frontiers with an active (unexpired) ban.
     keep = [i for i in range(frontiers.shape[0])
             if not self._blacklisted(self._bl_key(frontiers[i]))]
@@ -932,7 +1475,7 @@ class ExplorationPlanner:
     robot_pose_cpu = robot_pose.cpu()
     robot_pos = robot_pose_cpu[:3, 3]
     if self.region_mode:
-      frontiers, order = self._region_plan(
+      frontiers, order = self._task_plan(
         frontiers, robot_pose_cpu, class_vox)
       if frontiers.shape[0] == 0:
         return

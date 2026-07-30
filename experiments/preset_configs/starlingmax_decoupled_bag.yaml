@@ -119,6 +119,15 @@ exploration:
   # commit to the nearest, approach it, exhaust its frontiers, move on
   # (see default.yaml `region_*` for all knobs).
   region_mode: True
+  # Project person detections to the ground and track them on the map
+  # (see default.yaml `person_*`/`detection_*` for the knobs).
+  detection_topic: /drone/detections
+  person_merge_radius: 2.5
+  # p_d = 0.7 makes a well-confirmed track (r ~ 0.99) survive ~5 rate-
+  # limited misses (~2.5s of the camera clearly seeing the spot without a
+  # detection) before existence drops below person_exist_remove; fresh
+  # low-confidence tracks die faster.
+  person_p_detect: 0.7
   # 2D information grid (unknown / non-obstacle / obstacle + confidence),
   # built per keyframe from the visible voxels: chosen-class voxels with no
   # other-class voxel beneath them (global-map check) mark non-obstacle;
@@ -133,9 +142,41 @@ exploration:
   # (e.g. 0.2-0.4) so isolated misclassified voxels cannot poison a cell —
   # mainly useful when grid_cell_size > vox_size.
   obstacle_min_frac: 0.5
-  xmin: 4.0
-  xmax: 15
-  ymin: -3
-  ymax: 15
+  # Shared frontier frame (must match the high-flying drone's mission
+  # config); bounds below are in this frame and replace xmin/xmax/ymin/ymax.
+  ff_origin_lat: 40.413131
+  ff_origin_lon: -79.946393
+  ff_origin_alt: 220.80565047594274
+  ff_heading_deg: -76.17
+  ff_map_min_x: -34.86
+  ff_map_max_x: 34.33
+  ff_map_min_y: -20.09
+  ff_map_max_y: 15.82
+  # Georeference of the Starling's local NED odometry: FILL PER TAKEOFF.
+  #   ned_origin_lat/lon/alt: WGS84 position of the odometry origin (where
+  #     the drone sat when odometry initialized).
+  #   ned_heading_deg: compass azimuth in degrees CLOCKWISE FROM TRUE NORTH
+  #     of the local NED +x axis (the direction the drone faced at init).
+  # NOTE the convention differs from ff_heading_deg, which is degrees CCW
+  # FROM EAST (the high-flyer's convention). Do NOT copy ff_heading_deg
+  # here: if the drone faces along the frame's X axis at init, the correct
+  # value is ned_heading_deg = 90 - ff_heading_deg.
+  # Left null, the planner warns and falls back to the local
+  # xmin/xmax/ymin/ymax bounds below.
+  # Current values: bag-testing placeholder putting the local origin at the
+  # frame origin, facing along the frame X axis. The frames then relate as
+  # frame_x = ned_x, frame_y = -ned_y — the y axis ALWAYS mirrors between
+  # the two (NED is z-down with +y right of +x; the frontier frame is
+  # ENU-based z-up with +Y left of +X); no heading choice removes that.
+  ned_origin_lat: 40.41350   # 40.41350 N (surveyed takeoff position)
+  ned_origin_lon: -79.94658  # 79.94658 W (west -> negative)
+  ned_origin_alt: 0.0
+  ned_heading_deg: 166.17  # = 90 - ff_heading_deg = 90 - (-76.17)
+  # Local-frame fallback bounds (pose frame), used only when the frontier
+  # frame is not fully configured.
+  xmin: -100.0
+  xmax: 100.0
+  ymin: -100.0
+  ymax: 100.0
 
   region_time_budget_s: 180

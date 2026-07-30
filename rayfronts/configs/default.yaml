@@ -109,6 +109,72 @@ exploration:
   region_coverage_done: 0.85
   region_time_budget_s: 180.0
   region_retire_cooldown_s: 180.0
+  # ---- Task selection (MAIPP-greedy): with region_mode on, the planner
+  # commits to ONE task at a time, chosen as the argmax utility over
+  # explore-region candidates and person-track revisit candidates:
+  #   region: task_w_mass * lambda_sum + task_w_prob * (1-exp(-lambda_sum))
+  #           - task_w_travel * dist,   lambda_sum = target_birth_density *
+  #           unexplored m^2 (v1: uniform undetected-person birth prior)
+  #   track:  task_w_exist * existence + task_w_cov * trace(P)
+  #           + task_w_stale * secs_since_seen - task_w_travel * dist
+  # Tracks are candidates only when existence >= track_task_min_existence
+  # and position sigma >= track_task_min_sigma (uncertainty actually grew).
+  # A track task flies to a viewpoint of the track mean and completes on
+  # re-acquisition (covariance collapsed below track_task_min_sigma), track
+  # removal, or track_task_time_budget_s.
+  target_birth_density: 0.01
+  task_w_mass: 1.0
+  task_w_prob: 0.5
+  task_w_exist: 1.0
+  task_w_cov: 0.2
+  task_w_stale: 0.005
+  task_w_travel: 0.05
+  track_task_min_existence: 0.3
+  track_task_min_sigma: 0.8
+  track_task_time_budget_s: 60.0
+  # People detection (vision_msgs/Detection2DArray; null disables). The
+  # bottom-center of each person bbox — where the person stands — is
+  # undistorted with the RGB calibration, cast through the camera pose at
+  # the detection stamp (rgb_stamp_offset applies), and intersected with the
+  # ground plane at the median ground-class voxel height. Detections within
+  # person_merge_radius of a tracked person update it (position EMA);
+  # farther ones create a new person. Projections whose ray is near the
+  # horizon or lands beyond detection_max_range are dropped as unreliable,
+  # as are detections without a pose within detection_max_pose_dt. Tracked
+  # people are drawn on the exploration/people rerun layer.
+  detection_topic: null
+  person_class_id: person
+  person_min_score: 0.5
+  person_merge_radius: 1.0
+  detection_max_range: 12.0
+  detection_max_pose_dt: 0.5
+  # People are Bernoulli-Kalman tracks (MAIPP-compatible): a stable track_id,
+  # a position mean, a 2x2 horizontal covariance P, and an existence
+  # probability r.
+  # - Association: a projected detection matches the track with the smallest
+  #   Mahalanobis distance within person_gate_chi2 (chi-square, 2 dof; 9.21
+  #   = 99%), with person_merge_radius as a plain euclidean floor. Stale
+  #   tracks have grown P, so their gate widens naturally.
+  # - Update: Kalman update with measurement sigma = person_meas_noise_base
+  #   + person_meas_noise_per_m * range (far/grazing projections trusted
+  #   less); existence rises as r <- 1-(1-r)(1-p_d).
+  # - Negative evidence: a track the camera should see (visible down to
+  #   lying height, in-frame, in-range, unoccluded; rate-limited to one per
+  #   person_negative_min_interval_s of message time) but no detection
+  #   matched lowers existence as r <- r(1-p_d)/(1-r*p_d) with p_d =
+  #   person_p_detect; r < person_exist_remove deletes the track. Requires
+  #   the detector to publish (possibly empty) Detection2DArray messages for
+  #   every processed frame.
+  # - Covariance grows by person_process_noise (m^2/s) while unobserved, so
+  #   P quantifies where/how-hard to look when revisiting (task selection).
+  person_p_detect: 0.6
+  person_exist_remove: 0.2
+  person_exist_confirm: 0.8
+  person_process_noise: 0.02
+  person_meas_noise_base: 0.3
+  person_meas_noise_per_m: 0.05
+  person_gate_chi2: 9.21
+  person_negative_min_interval_s: 0.5
   # Seconds between planning cycles.
   plan_period: 2.0
   # Goal output: bare geometry_msgs/Pose in the pose-topic world frame
@@ -144,10 +210,35 @@ exploration:
   # Height (world RDF y) at which the info grid layer is rendered in rerun.
   # null = median stored ground height across cells. Display only.
   grid_vis_height: null
+  # Shared frontier-mapping frame for multi-robot operation. When
+  # ff_origin_lat is set (together with the ned_origin_* georeference), all
+  # planar bookkeeping — info-grid cell keys, region segmentation, bounds —
+  # happens in the mission-level global frame used by the high-flying drone:
+  # ENU at (ff_origin_lat, ff_origin_lon) with X rotated ff_heading_deg CCW
+  # from East. Map cells then align across robots. Bounds come from
+  # ff_map_min/max_x/y (in the frontier frame) and REPLACE xmin/xmax/ymin/
+  # ymax. Goal publishing stays in the local pose-topic frame.
+  ff_origin_lat: null
+  ff_origin_lon: null
+  ff_origin_alt: 0.0
+  ff_heading_deg: 0.0
+  ff_map_min_x: null
+  ff_map_max_x: null
+  ff_map_min_y: null
+  ff_map_max_y: null
+  # Georeference of the local NED odometry frame: global position of the
+  # local-frame origin and the compass azimuth (degrees clockwise from TRUE
+  # north) of the local NED +x axis — i.e. the drone's heading when odometry
+  # initialized. Required whenever ff_origin_lat is set.
+  ned_origin_lat: null
+  ned_origin_lon: null
+  ned_origin_alt: 0.0
+  ned_heading_deg: 0.0
   # Exploration xy bounds, in the POSE-TOPIC world frame (e.g. PX4 NED map:
   # x north-ish, y east-ish — the same frame goals are published in). Outside
   # [xmin, xmax] x [ymin, ymax]: class-specific frontiers are not generated
-  # and the 2D info grid takes no votes. null = unbounded. Applied when
+  # and the 2D info grid takes no votes. null = unbounded. Ignored when a
+  # frontier frame is configured (ff_map_* applies instead). Applied when
   # running the exploration planner entry point.
   xmin: null
   xmax: null
