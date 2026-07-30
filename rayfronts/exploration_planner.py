@@ -46,7 +46,7 @@ from rayfronts.mapping_server import MappingServer, signal_handler
 from rayfronts.mapping.semantic_ray_frontiers_map import rayfronts_cpp
 
 try:
-  from geometry_msgs.msg import Pose
+  from geometry_msgs.msg import Pose, PolygonStamped, Point32
   from std_msgs.msg import Int8
   from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
   from scipy.spatial.transform import Rotation
@@ -59,9 +59,18 @@ except ModuleNotFoundError:
   scipy_label = None
 
 try:
-  from vision_msgs.msg import Detection2DArray
+  from vision_msgs.msg import (Detection2DArray, Detection3DArray,
+                               Detection3D, ObjectHypothesisWithPose)
 except ModuleNotFoundError:
   Detection2DArray = None
+  Detection3DArray = None
+
+try:
+  from nav_msgs.msg import OccupancyGrid
+except ModuleNotFoundError:
+  OccupancyGrid = None
+
+from rayfronts.geo_frame import points_in_polygon
 
 logger = logging.getLogger(__name__)
 
@@ -203,8 +212,27 @@ class ExplorationPlanner:
     self.track_task_min_existence = float(
       cfg.get("track_task_min_existence", 0.3))
     self.track_task_min_sigma = float(cfg.get("track_task_min_sigma", 0.8))
+    self.track_task_min_unseen_s = float(
+      cfg.get("track_task_min_unseen_s", 240.0))
     self.track_task_time_budget_s = float(
       cfg.get("track_task_time_budget_s", 60.0))
+
+    # Multi-robot MAIPP comms (see _setup_comms): coverage grids, person
+    # tracks, and task claims exchanged with peers on standard topics
+    # (/robot_<id>/maipp/...), all in frontier-frame coordinates.
+    self.robot_id = int(cfg.get("robot_id", 0))
+    self.peer_robot_ids = [int(x)
+                           for x in (cfg.get("peer_robot_ids", None) or [])]
+    self.comms_publish_period_s = float(
+      cfg.get("comms_publish_period_s", 3.0))
+    self.claim_ttl_s = float(cfg.get("claim_ttl_s", 10.0))
+    self._peer_cover = {}   # rid -> set of grid-window cells (i, j)
+    self._peer_claim = {}   # rid -> dict(cells=set|None, point=xy|None, t)
+    self._imported = {}     # "rid:tid" -> local track_id
+    self._comms_queue = deque(maxlen=64)
+    self._comms_lock = threading.Lock()
+    self._last_comms_pub = 0.0
+    self._pub_cover = None
     self._retired = {}    # cell (i, j) -> retirement expiry walltime
     if self.region_mode and self.grid_bounds is None:
       logger.warning("region_mode requires bounds (xmin/xmax/ymin/ymax or a "
@@ -310,6 +338,8 @@ class ExplorationPlanner:
             "People detections on %s (class '%s', min score %.2f, merge "
             "radius %.1fm).", self.detection_topic, self.person_class_id,
             self.person_min_score, self.person_merge_radius)
+      if self.robot_id > 0:
+        self._setup_comms(ds)
       logger.info("Exploration goal publisher on %s (Pose, NED frame); "
                   "listening for reach status on %s; goal publishing "
                   "enable switch on %s.", cfg.goal_topic,
@@ -492,6 +522,10 @@ class ExplorationPlanner:
     # attempt to record autograd state and fail.
     while not self._stop.is_set():
       try:
+        self._update_comms()
+      except Exception:
+        logger.exception("Peer comms update failed.")
+      try:
         self._update_people()
       except Exception:
         logger.exception("People update failed.")
@@ -499,6 +533,10 @@ class ExplorationPlanner:
         self._update_info_grid()
       except Exception:
         logger.exception("Info grid update failed.")
+      try:
+        self._publish_comms()
+      except Exception:
+        logger.exception("Comms publish failed.")
       try:
         self._plan_once()
       except Exception:  # Keep planning alive; mapping owns the process.
@@ -811,6 +849,297 @@ class ExplorationPlanner:
     except Exception:
       logger.exception("Failed to visualize people.")
 
+  # ---------- multi-robot MAIPP comms ----------
+
+  def _setup_comms(self, ds):
+    """Publishers/subscribers for inter-robot belief sharing.
+
+    Standard topics under /robot_<id>/maipp, all in frontier-frame
+    coordinates:
+      coverage_grid  nav_msgs/OccupancyGrid   (-1 unknown, 0 ground,
+                                               100 obstacle)
+      tracks         vision_msgs/Detection3DArray (id "<rid>:<tid>",
+                     score=existence, pose+covariance, stamp=last_seen)
+      task_claim     geometry_msgs/PolygonStamped (region bbox | single
+                     point at a claimed track | empty = idle)
+    """
+    if OccupancyGrid is None or Detection3DArray is None:
+      logger.warning("nav_msgs/vision_msgs unavailable; multi-robot comms "
+                     "disabled.")
+      return
+    if self.grid_bounds is None:
+      logger.warning("Multi-robot comms require xy bounds / frontier frame; "
+                     "disabled.")
+      return
+    node = ds._rosnode
+    self._comms_node = node
+    ns = "/robot_%d/maipp" % self.robot_id
+    self._pub_cover = node.create_publisher(
+      OccupancyGrid, ns + "/coverage_grid", 1)
+    self._pub_tracks = node.create_publisher(
+      Detection3DArray, ns + "/tracks", 1)
+    self._pub_claim = node.create_publisher(
+      PolygonStamped, ns + "/task_claim", 1)
+    for rid in self.peer_robot_ids:
+      if rid == self.robot_id:
+        continue
+      pns = "/robot_%d/maipp" % rid
+      node.create_subscription(
+        OccupancyGrid, pns + "/coverage_grid",
+        partial(self._on_peer_msg, "cover", rid), 1)
+      node.create_subscription(
+        Detection3DArray, pns + "/tracks",
+        partial(self._on_peer_msg, "tracks", rid), 1)
+      node.create_subscription(
+        PolygonStamped, pns + "/task_claim",
+        partial(self._on_peer_msg, "claim", rid), 1)
+    logger.info("MAIPP comms up as robot_%d (peers %s, period %.1fs).",
+                self.robot_id, self.peer_robot_ids,
+                self.comms_publish_period_s)
+
+  def _on_peer_msg(self, kind, rid, msg):
+    """ROS callback: reduce peer messages to plain data and queue them."""
+    if kind == "cover":
+      w, h = msg.info.width, msg.info.height
+      if w == 0 or h == 0:
+        return
+      data = np.array(msg.data, dtype=np.int8).reshape(h, w)
+      rows, cols = np.nonzero(data >= 0)
+      res = float(msg.info.resolution)
+      xs = float(msg.info.origin.position.x) + (cols + 0.5) * res
+      ys = float(msg.info.origin.position.y) + (rows + 0.5) * res
+      payload = (xs, ys)
+    elif kind == "tracks":
+      payload = []
+      for det in msg.detections:
+        if len(det.results) == 0:
+          continue
+        hyp = det.results[0]
+        c = hyp.pose.covariance
+        payload.append((
+          str(det.id),
+          float(hyp.pose.pose.position.x), float(hyp.pose.pose.position.y),
+          (float(c[0]), float(c[1]), float(c[6]), float(c[7])),
+          float(hyp.hypothesis.score),
+          det.header.stamp.sec + det.header.stamp.nanosec * 1e-9))
+    else:  # claim
+      payload = [(float(p.x), float(p.y)) for p in msg.polygon.points]
+    with self._comms_lock:
+      self._comms_queue.append((kind, rid, payload))
+
+  def _update_comms(self):
+    """Fuses queued peer messages (planner thread)."""
+    if self.robot_id <= 0:
+      return
+    with self._comms_lock:
+      items = list(self._comms_queue)
+      self._comms_queue.clear()
+    if len(items) == 0:
+      return
+    now = time.time()
+    ix0, iz0, nx, nz = self._region_grid()
+    g = self.grid_cell_size
+    for kind, rid, payload in items:
+      if kind == "cover":
+        xs, ys = payload
+        i = np.round(xs / g).astype(np.int64) - ix0
+        j = np.round(ys / g).astype(np.int64) - iz0
+        ok = (i >= 0) & (i < nx) & (j >= 0) & (j < nz)
+        self._peer_cover[rid] = set(
+          zip(i[ok].tolist(), j[ok].tolist()))
+      elif kind == "tracks":
+        self._fuse_peer_tracks(rid, payload)
+      else:  # claim
+        if len(payload) == 0:
+          self._peer_claim.pop(rid, None)
+        elif len(payload) < 3:
+          self._peer_claim[rid] = dict(cells=None, point=payload[0], t=now)
+        else:
+          ii, jj = np.meshgrid(np.arange(nx), np.arange(nz), indexing="ij")
+          centers = np.stack([(ii.reshape(-1) + ix0) * g,
+                              (jj.reshape(-1) + iz0) * g], axis=-1)
+          inside = points_in_polygon(centers, np.array(payload))
+          cells = set(zip((ii.reshape(-1)[inside]).tolist(),
+                          (jj.reshape(-1)[inside]).tolist()))
+          self._peer_claim[rid] = dict(cells=cells, point=None, t=now)
+
+  def _fuse_peer_tracks(self, rid, dets):
+    """Merges a peer's track list into the local Bernoulli-KF tracks.
+
+    Idempotent under periodic re-reception: a matched track adopts the
+    peer's mean/covariance only when the peer is more certain (smaller
+    covariance trace); existence and last_seen take the max. Unmatched
+    peer tracks are imported as local tracks (remembering their foreign
+    id so later messages update rather than duplicate).
+    """
+    with self.server.map_lock:
+      cls = self.mapper.class_voxels_xyz
+      gy = (float(cls[:, 1].median())
+            if cls is not None and cls.shape[0] > 0 else None)
+    if gy is None:
+      if len(self.people) > 0:
+        gy = float(self.people[0]["pos"][1])
+      else:
+        return  # no ground estimate yet; peers republish periodically
+    changed = False
+    for key, fx, fy, cov4, r_rem, stamp in dets:
+      if key.startswith("%d:" % self.robot_id):
+        continue  # our own track echoed back through a relay
+      pos = self._grid_xy_to_rdf(torch.tensor([[fx, fy]]), gy)[0]
+      P_frame = torch.tensor([[cov4[0], cov4[1]], [cov4[2], cov4[3]]],
+                             dtype=torch.float)
+      P_rem = self._grid_R_inv @ P_frame @ self._grid_R_inv.T
+      target = None
+      if key in self._imported:
+        target = next((p for p in self.people
+                       if p["track_id"] == self._imported[key]), None)
+      if target is None:
+        z = torch.tensor([float(pos[0]), float(pos[2])])
+        for person in self.people:
+          mu = torch.tensor([float(person["pos"][0]),
+                             float(person["pos"][2])])
+          innov = z - mu
+          S = person["cov"] + P_rem
+          d2 = float(innov @ torch.linalg.solve(S, innov))
+          if (d2 <= self.person_gate_chi2 or
+              float(innov.norm()) <= self.person_merge_radius):
+            target = person
+            break
+      if target is not None:
+        self._imported[key] = target["track_id"]
+        if float(torch.trace(P_rem)) < float(torch.trace(target["cov"])):
+          target["pos"] = pos.clone()
+          target["cov"] = P_rem
+        target["existence"] = max(target["existence"], r_rem)
+        target["last_seen"] = max(target["last_seen"], stamp)
+        target["status"] = self._person_status(target)
+        changed = True
+      else:
+        self.people.append(dict(
+          track_id=self._next_track_id, pos=pos.clone(), cov=P_rem,
+          existence=r_rem, status="candidate", n_obs=1, last_seen=stamp,
+          score=r_rem, last_neg_stamp=-10**18))
+        self._imported[key] = self._next_track_id
+        logger.info("Imported person track %s from robot_%d as #%d at "
+                    "(%.1f, %.1f).", key, rid, self._next_track_id,
+                    float(pos[0]), float(pos[2]))
+        self._next_track_id += 1
+        changed = True
+    if changed:
+      self._vis_people()
+
+  def _track_claimed(self, person):
+    """True if a fresh peer claim points at this track."""
+    now = time.time()
+    pxy = self._grid_xy(person["pos"].reshape(1, 3))[0]
+    for c in self._peer_claim.values():
+      if now - c["t"] > self.claim_ttl_s or c.get("point") is None:
+        continue
+      if (math.hypot(float(pxy[0]) - c["point"][0],
+                     float(pxy[1]) - c["point"][1])
+          <= self.person_merge_radius):
+        return True
+    return False
+
+  def _claimed_cells(self):
+    """Union of cells inside fresh peer region claims (expired ones drop)."""
+    now = time.time()
+    cells = set()
+    for rid in list(self._peer_claim.keys()):
+      c = self._peer_claim[rid]
+      if now - c["t"] > self.claim_ttl_s:
+        self._peer_claim.pop(rid)
+      elif c.get("cells"):
+        cells |= c["cells"]
+    return cells
+
+  def _publish_comms(self):
+    """Periodically publishes coverage grid, tracks, and the task claim."""
+    if self._pub_cover is None:
+      return
+    now = time.time()
+    if now - self._last_comms_pub < self.comms_publish_period_s:
+      return
+    self._last_comms_pub = now
+    stamp = self._comms_node.get_clock().now().to_msg()
+    try:
+      self._pub_cover.publish(self._build_cover_msg(stamp))
+      self._pub_tracks.publish(self._build_tracks_msg(stamp))
+      self._pub_claim.publish(self._build_claim_msg(stamp))
+    except Exception:
+      logger.exception("Failed to publish MAIPP comms.")
+
+  def _build_cover_msg(self, stamp):
+    ix0, iz0, nx, nz = self._region_grid()
+    g = self.grid_cell_size
+    grid = np.full((nz, nx), -1, dtype=np.int8)
+    for (ix, iz), cell in self.info_grid.items():
+      i, j = ix - ix0, iz - iz0
+      if 0 <= i < nx and 0 <= j < nz:
+        grid[j, i] = 100 if cell[0] == 2 else 0
+    msg = OccupancyGrid()
+    msg.header.stamp = stamp
+    msg.header.frame_id = "frontier_frame"
+    msg.info.resolution = float(g)
+    msg.info.width = nx
+    msg.info.height = nz
+    msg.info.origin.position.x = (ix0 - 0.5) * g
+    msg.info.origin.position.y = (iz0 - 0.5) * g
+    msg.info.origin.orientation.w = 1.0
+    msg.data = grid.reshape(-1).tolist()
+    return msg
+
+  def _build_tracks_msg(self, stamp):
+    arr = Detection3DArray()
+    arr.header.stamp = stamp
+    arr.header.frame_id = "frontier_frame"
+    for p in self.people:
+      det = Detection3D()
+      det.header.frame_id = "frontier_frame"
+      det.header.stamp.sec = int(p["last_seen"])
+      det.header.stamp.nanosec = int((p["last_seen"] % 1.0) * 1e9)
+      det.id = "%d:%d" % (self.robot_id, p["track_id"])
+      hyp = ObjectHypothesisWithPose()
+      hyp.hypothesis.class_id = self.person_class_id
+      hyp.hypothesis.score = float(p["existence"])
+      pxy = self._grid_xy(p["pos"].reshape(1, 3))[0]
+      hyp.pose.pose.position.x = float(pxy[0])
+      hyp.pose.pose.position.y = float(pxy[1])
+      P_frame = self._grid_R @ p["cov"] @ self._grid_R.T
+      cov = [0.0] * 36
+      cov[0] = float(P_frame[0, 0])
+      cov[1] = float(P_frame[0, 1])
+      cov[6] = float(P_frame[1, 0])
+      cov[7] = float(P_frame[1, 1])
+      hyp.pose.covariance = cov
+      det.results.append(hyp)
+      arr.detections.append(det)
+    return arr
+
+  def _build_claim_msg(self, stamp):
+    msg = PolygonStamped()
+    msg.header.stamp = stamp
+    msg.header.frame_id = "frontier_frame"
+    t = self._task
+    if t is not None and t["type"] == "region":
+      ix0, iz0, _, _ = self._region_grid()
+      g = self.grid_cell_size
+      arr = np.array(sorted(t["cells"]), dtype=np.float64)
+      x_lo = (arr[:, 0].min() + ix0) * g - 0.5 * g
+      x_hi = (arr[:, 0].max() + ix0) * g + 0.5 * g
+      y_lo = (arr[:, 1].min() + iz0) * g - 0.5 * g
+      y_hi = (arr[:, 1].max() + iz0) * g + 0.5 * g
+      for x, y in ((x_lo, y_lo), (x_hi, y_lo), (x_hi, y_hi), (x_lo, y_hi)):
+        msg.polygon.points.append(Point32(x=float(x), y=float(y), z=0.0))
+    elif t is not None:
+      track = next((p for p in self.people
+                    if p["track_id"] == t["track_id"]), None)
+      if track is not None:
+        pxy = self._grid_xy(track["pos"].reshape(1, 3))[0]
+        msg.polygon.points.append(
+          Point32(x=float(pxy[0]), y=float(pxy[1]), z=0.0))
+    return msg
+
   # ---------- region-based hierarchical exploration ----------
 
   def _region_grid(self):
@@ -849,6 +1178,12 @@ class ExplorationPlanner:
     for (i, j) in self._retired:
       if 0 <= i < nx and 0 <= j < nz:
         unknown[i, j] = False
+    # Ground a peer already classified is not unexplored (this also counts
+    # toward our committed region's coverage, which is correct).
+    for cells in self._peer_cover.values():
+      for (i, j) in cells:
+        if 0 <= i < nx and 0 <= j < nz:
+          unknown[i, j] = False
     return unknown
 
   def _segment_unknown(self, unknown):
@@ -922,9 +1257,10 @@ class ExplorationPlanner:
       area (v1 PMB-lite: uniform undetected-target birth prior; no
       detector-sweep thinning yet).
     Track (revisit): w_exist * existence + w_cov * trace(P) + w_stale *
-      time_since_seen - w_travel * dist, for tracks worth revisiting
-      (existence >= track_task_min_existence and position sigma >=
-      track_task_min_sigma, i.e. uncertainty actually grew since last seen).
+      time_since_seen - w_travel * dist, for tracks worth revisiting:
+      existence >= track_task_min_existence, position sigma >=
+      track_task_min_sigma, AND unseen for at least track_task_min_unseen_s
+      (the empirical re-observation cadence; exploration wins until then).
     Returns (best task dict or None, n_region_cands, n_track_cands).
     """
     now = time.time()
@@ -943,7 +1279,9 @@ class ExplorationPlanner:
     for p in self.people:
       sigma = math.sqrt(0.5 * float(torch.trace(p["cov"])))
       if (p["existence"] < self.track_task_min_existence or
-          sigma < self.track_task_min_sigma):
+          sigma < self.track_task_min_sigma or
+          now - p["last_seen"] < self.track_task_min_unseen_s or
+          self._track_claimed(p)):
         continue
       pxy = self._grid_xy(p["pos"].reshape(1, 3))[0]
       dist = math.hypot(float(pxy[0]) - robot_xy[0],
@@ -1004,13 +1342,16 @@ class ExplorationPlanner:
       elif age > self.track_task_time_budget_s:
         self._finish_task("time budget exceeded (%.0fs)" % age)
 
-    # Cells retired above (this same cycle) must not be re-selectable.
-    if self._retired:
+    # Cells retired above (this same cycle) and cells inside fresh peer
+    # region claims must not be selectable (claims are selection-only:
+    # they do not count as covered for our committed task).
+    excl = set(self._retired.keys()) | self._claimed_cells()
+    if excl:
       nx, nz = unknown.shape
-      for (i, j) in self._retired:
+      for (i, j) in excl:
         if 0 <= i < nx and 0 <= j < nz:
           unknown[i, j] = False
-      unknown_set -= set(self._retired.keys())
+      unknown_set -= excl
 
     # Commit to the best-scoring task if none is active.
     if self._task is None:

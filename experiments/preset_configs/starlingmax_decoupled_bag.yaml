@@ -128,6 +128,11 @@ exploration:
   # detection) before existence drops below person_exist_remove; fresh
   # low-confidence tracks die faster.
   person_p_detect: 0.7
+  # Multi-robot MAIPP comms: this starling is robot_2; the high-flyer
+  # (robot_1) contributes coverage/tracks/claims on /robot_1/maipp/*
+  # (see default.yaml for the protocol).
+  robot_id: 2
+  peer_robot_ids: [1]
   # 2D information grid (unknown / non-obstacle / obstacle + confidence),
   # built per keyframe from the visible voxels: chosen-class voxels with no
   # other-class voxel beneath them (global-map check) mark non-obstacle;

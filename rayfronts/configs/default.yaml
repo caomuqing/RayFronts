@@ -117,9 +117,11 @@ exploration:
   #           unexplored m^2 (v1: uniform undetected-person birth prior)
   #   track:  task_w_exist * existence + task_w_cov * trace(P)
   #           + task_w_stale * secs_since_seen - task_w_travel * dist
-  # Tracks are candidates only when existence >= track_task_min_existence
-  # and position sigma >= track_task_min_sigma (uncertainty actually grew).
-  # A track task flies to a viewpoint of the track mean and completes on
+  # Tracks are candidates only when existence >= track_task_min_existence,
+  # position sigma >= track_task_min_sigma (uncertainty actually grew), AND
+  # the person has been unseen for track_task_min_unseen_s — the empirical
+  # re-observation cadence; exploration always wins until then. A track
+  # task flies to a viewpoint of the track mean and completes on
   # re-acquisition (covariance collapsed below track_task_min_sigma), track
   # removal, or track_task_time_budget_s.
   target_birth_density: 0.01
@@ -131,7 +133,28 @@ exploration:
   task_w_travel: 0.05
   track_task_min_existence: 0.3
   track_task_min_sigma: 0.8
+  track_task_min_unseen_s: 240.0
   track_task_time_budget_s: 60.0
+  # ---- Multi-robot MAIPP comms. With robot_id > 0, the planner publishes
+  # under /robot_<robot_id>/maipp (all in frontier-frame coordinates):
+  #   coverage_grid  nav_msgs/OccupancyGrid  (-1 unknown / 0 ground /
+  #                  100 obstacle, resolution = grid_cell_size)
+  #   tracks         vision_msgs/Detection3DArray (id "<rid>:<tid>",
+  #                  score = existence, pose + xy covariance,
+  #                  per-detection stamp = last seen; assumes synced clocks)
+  #   task_claim     geometry_msgs/PolygonStamped (region bbox, a single
+  #                  point at a claimed track, or empty when idle)
+  # and subscribes to the same topics of every peer_robot_ids entry. Fusion:
+  # peer-classified cells stop being unexplored (regions never target them);
+  # peer tracks merge into local ones by Mahalanobis gating (peer mean/cov
+  # adopted when more certain, existence/last-seen take the max) or are
+  # imported as new tracks; fresh peer claims (younger than claim_ttl_s)
+  # exclude their region cells / claimed track from our task selection.
+  # robot_id 0 disables comms. Convention: high-flyer = 1, starlings 2+.
+  robot_id: 0
+  peer_robot_ids: []
+  comms_publish_period_s: 3.0
+  claim_ttl_s: 10.0
   # People detection (vision_msgs/Detection2DArray; null disables). The
   # bottom-center of each person bbox — where the person stands — is
   # undistorted with the RGB calibration, cast through the camera pose at
