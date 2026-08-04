@@ -27,6 +27,10 @@ class BehaviorManager:
             keepout_polygons=keepout_polygons)
         self.behaviors = [self.ray_behavior, self.frontier_behavior]
 
+    def set_task_planner(self, task_planner):
+        """Attaches the MAIPP task layer to frontier viewpoint selection."""
+        self.frontier_behavior.task_planner = task_planner
+
     def mode_select(self, queries_labels, target_objects, queries_feats, mapper, publisher_dict, subscriber_dict):
         for behavior in self.behaviors:
             if behavior.condition_check(queries_labels, target_objects, queries_feats, mapper, publisher_dict, subscriber_dict):

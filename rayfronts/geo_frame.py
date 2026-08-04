@@ -203,6 +203,22 @@ class FrontierFrame:
         self.home_fixed = True
     return self.home_fixed
 
+  def set_home(self, lat_deg, lon_deg, alt_m):
+    """Fixes the home (local-frame origin) directly from surveyed values.
+
+    Alternative to the online GPS estimation (update_home) for robots whose
+    local-frame origin is known at takeoff (e.g. a surveyed launch point),
+    or for bag-replay tests where no live GPS fix is available.
+    """
+    self._home_lat = float(lat_deg)
+    self._home_lon = float(lon_deg)
+    self._home_alt = float(alt_m)
+    # Sync the frame origin altitude to home altitude (as update_home does)
+    # so the planar x/y transform is not skewed by an altitude offset.
+    self.origin_alt = float(alt_m)
+    self._recompute_affine()
+    self.home_fixed = True
+
   def _local_to_frame_exact(self, pos_local):
     """Exact single-point local(ENU@home) -> frontier-frame transform."""
     ecef = enu_to_ecef(pos_local, self._home_lat, self._home_lon, self._home_alt)

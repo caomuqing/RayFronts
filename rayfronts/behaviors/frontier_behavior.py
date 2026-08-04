@@ -15,6 +15,11 @@ class FrontierBehavior:
                  keepout_polygons=None):
         self.get_clock = get_clock
         self.name = 'Frontier-based'
+        # Optional MAIPP task layer (rayfronts.task_planner). When set, the
+        # committed region/track task filters or replaces the candidate
+        # viewpoints before the distance/momentum selection below; when
+        # None the original global selection is unchanged.
+        self.task_planner = None
         # Keepout zones: list of (M, 2) arrays of polygon corners in the
         # frontier frame. Frontier points inside any polygon are discarded,
         # and no viewpoint (cluster centroid) inside one may become a waypoint.
@@ -115,9 +120,25 @@ class FrontierBehavior:
                 if centroid_torch[2] > 4.0:
                     centroid_torch[2] = 8.0 #manually set height of frontier 6m
                     viewpoints.append(centroid_torch)
-            if len(viewpoints) == 0:
+            if len(viewpoints) > 0:
+                viewpoints = torch.stack(viewpoints)
+            else:
+                # Keep going with an empty candidate set: a committed track
+                # task can still produce a pseudo-viewpoint even when the
+                # bounded area has no frontier clusters left.
+                viewpoints = torch.zeros(
+                    (0, 3), dtype=transformed_frontiers.dtype)
+
+            # MAIPP task layer: restrict candidates to the committed
+            # region's viewpoints, an approach viewpoint toward its
+            # centroid, or a track-revisit pseudo-viewpoint.
+            if self.task_planner is not None:
+                viewpoints = self.task_planner.select(
+                    viewpoints.cpu(), cur_pose_np, mapper=mapper).to(
+                        dtype=transformed_frontiers.dtype)
+
+            if viewpoints.shape[0] == 0:
                 return waypoint_locked, target_waypoint, target_waypoint2
-            viewpoints = torch.stack(viewpoints)
 
             cent_msg = self.create_pointcloud2_msg(viewpoints)
             viewpoint_publisher.publish(cent_msg)

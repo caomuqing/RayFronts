@@ -53,6 +53,29 @@ occ_pruning_period: 8
 # Tolerance when consolidating voxels into bigger ones.
 occ_pruning_tolerance: 2
 
+# Hysteresis on label deletion: erase a voxel's semantics only once it is
+# confidently empty (log-odds <= -3), not on the first transient carve.
+# Prevents depth jitter from stripping labels off a patch that immediately
+# gets re-observed. (Empty passes are -1 each; an occupied hit is
+# +occ_observ_weight.)
+sem_pruning_thresh: -3
+
+# Second line of defense: voxels that do get pruned keep their labels in a
+# CPU cache for this long (seconds) and are restored if re-occupied within
+# the window. Set to 0 to disable.
+sem_label_cache_ttl: 600
+
+# "Chosen" (ground-like) classes for get_class_partition, used by the 2D
+# information grid: voxels argmax-classified as one of these are ground
+# candidates, everything else votes obstacle. Must be labels from the query
+# file (test.txt). Kept consistent with the low drone's
+# class_frontier_classes so both robots agree on ground vs obstacle.
+class_frontier_classes: ["ground", "grass", "road"]
+
+# Minimum softmax probability of the argmax class for a voxel to count as
+# classified into class_frontier_classes.
+class_frontier_min_prob: 0.4
+
 ## Frontier calculation
 
 # 3D neighborhood radius to compute if a voxel is a frontier or not

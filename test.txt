@@ -3,3 +3,7 @@ tree
 road
 parking lot
 grass
+ground
+car
+tent
+building

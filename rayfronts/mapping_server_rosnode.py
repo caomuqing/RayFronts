@@ -36,7 +36,11 @@ import rclpy
 from rclpy.node import Node
 import std_msgs.msg
 from std_msgs.msg import String
-from nav_msgs.msg import Path
+from nav_msgs.msg import Path, OccupancyGrid, Odometry
+try:
+  from vision_msgs.msg import Detection2DArray, Detection3DArray
+except ImportError:
+  Detection2DArray = Detection3DArray = None
 from geometry_msgs.msg import PoseStamped
 import scipy.ndimage
 from sensor_msgs.msg import PointCloud2, PointField
@@ -45,9 +49,14 @@ from std_msgs.msg import Header, ColorRGBA
 from sensor_msgs_py import point_cloud2
 from sensor_msgs.msg import NavSatFix
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, TransformStamped, PolygonStamped
+from tf2_ros import StaticTransformBroadcaster
+from collections import deque
 from rayfronts import geometry3d as g3d
 from rayfronts.geo_frame import FrontierFrame
+from rayfronts.info_grid import InfoGrid2D
+from rayfronts.person_tracker import PersonTracker
+from rayfronts.task_planner import MaippTaskPlanner
 from rayfronts.utils import compute_cos_sim
 from rclpy.qos import (
     QoSProfile,
@@ -98,6 +107,21 @@ class MappingServer(Node):
       origin_lon=-79.946393,
       origin_alt=220.80565047594274,
       heading_deg=-76.17)
+
+    # Bag-replay / surveyed-takeoff override: fix home directly instead of
+    # waiting for a live GPS fix (bags without the mavros GPS topic would
+    # otherwise leave the frontier frame forever not-ready). Enable with:
+    #   +fix_home_lat=40.41350 +fix_home_lon=-79.94658 +fix_home_alt=220.8
+    fix_home_lat = cfg.get("fix_home_lat", None)
+    if fix_home_lat is not None:
+      self.geo_frame.set_home(
+        float(fix_home_lat), float(cfg.fix_home_lon),
+        float(cfg.get("fix_home_alt", 0.0)))
+      logger.info(
+        "geo_frame home FIXED from config: (%.6f, %.6f, %.1f); live GPS "
+        "will not override it.",
+        self.geo_frame._home_lat, self.geo_frame._home_lon,
+        self.geo_frame._home_alt)
 
     # Inscribed box (fully inside the 4 surveyed boundary corners) in the
     # frontier frame at heading -76.17. See bound_coordinates.
@@ -219,6 +243,100 @@ class MappingServer(Node):
     self.mapper: mapping.RGBDMapping = hydra.utils.instantiate(
       cfg.mapping, intrinsics_3x3=intrinsics_3x3, visualizer=self.vis,
       **mapper_kwargs)
+
+    # 2D class-specific information grid shared with the low-flying drone
+    # (MAIPP comms). Cells are keyed in the frontier frame; cell size and
+    # vote semantics must match the peer's grid_cell_size (0.5) so coverage
+    # cells align across robots. Published as an OccupancyGrid on
+    # /robot_1/maipp/coverage_grid (this drone is robot_1).
+    self.info_grid = InfoGrid2D(
+      vox_size=self.mapper.vox_size,
+      geo_frame=self.geo_frame,
+      bounds=(self.map_min_x, self.map_max_x,
+              self.map_min_y, self.map_max_y),
+      cell_size=0.5,
+      obstacle_max_height_voxels=10,
+      obstacle_min_frac=0.5)
+    self.coverage_grid_publisher = self.create_publisher(
+      OccupancyGrid, '/robot_1/maipp/coverage_grid', 1)
+    # Latched map -> frontier_frame transform so RViz can render the
+    # coverage grid overlaid with the rest of the 'map'-frame topics.
+    self._tf_static_broadcaster = StaticTransformBroadcaster(self)
+
+    # Person tracking from the gimbal detector (MAIPP tracks contract).
+    # Bboxes on /robot_1/gimbal/boundingbox are produced on the front-stereo
+    # left frames but in the camera's NATIVE 1920x1080 pixel space; the
+    # dataset intrinsics (scaled to depth resolution) are rescaled to match.
+    self.person_tracker = None
+    if Detection2DArray is None:
+      logger.warning("vision_msgs unavailable; person tracking disabled.")
+    else:
+      det_w, det_h = 1920, 1080
+      k_det = self.dataset.intrinsics_3x3.clone().float()
+      k_det[0, :] *= det_w / float(self.dataset.depth_w)
+      k_det[1, :] *= det_h / float(self.dataset.depth_h)
+      self.person_tracker = PersonTracker(
+        intrinsics_3x3=k_det,
+        det_resolution=(det_w, det_h),
+        src2rdf=self.dataset.src2rdf_transform,
+        vox_size=self.mapper.vox_size,
+        robot_id=1)
+      det_qos = QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        durability=DurabilityPolicy.VOLATILE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=10)
+      self.create_subscription(
+        Detection2DArray, '/robot_1/gimbal/boundingbox',
+        self.person_tracker.on_detections, det_qos)
+      # Raw odometry buffer for stamp-matched projection (detections arrive
+      # at camera rate; the dataset's synced frames are far sparser).
+      self.create_subscription(
+        Odometry, cfg.dataset.pose_topic,
+        self.person_tracker.on_odom, det_qos)
+      self.tracks_publisher = self.create_publisher(
+        Detection3DArray, '/robot_1/maipp/tracks', 1)
+      self.people_markers_publisher = self.create_publisher(
+        MarkerArray, '/people_tracks', 1)
+
+    # MAIPP comms cadence: wall-clock, decoupled from the frame-driven
+    # query cycle. The low flyer expires peer claims after ~10s
+    # (claim_ttl_s), so tying publishes to every Nth frame would let our
+    # claim flicker out whenever the frame rate dips.
+    self.comms_publish_period_s = 3.0
+    self._last_comms_pub = 0.0
+
+    # MAIPP task layer: region-based coverage + person-track revisit task
+    # selection over the frontier viewpoints, cooperating with the low
+    # flyer (robot_2) through its coverage / tracks / task claims.
+    self.task_planner = None
+    self._peer_tracks_queue = deque(maxlen=8)
+    if self.person_tracker is None:
+      logger.warning("Person tracker unavailable; MAIPP task planner "
+                     "disabled.")
+    else:
+      self.task_planner = MaippTaskPlanner(
+        geo_frame=self.geo_frame,
+        info_grid=self.info_grid,
+        tracker=self.person_tracker,
+        robot_id=1,
+        hover_height=8.0,
+        keepout_polygons=self.keepout_polygons)
+      self.behavior_manager.set_task_planner(self.task_planner)
+      peer_ns = '/robot_2/maipp'
+      self.create_subscription(
+        OccupancyGrid, peer_ns + '/coverage_grid',
+        partial(self.task_planner.on_peer_cover, 2), 10)
+      self.create_subscription(
+        PolygonStamped, peer_ns + '/task_claim',
+        partial(self.task_planner.on_peer_claim, 2), 10)
+      # Peer tracks are queued and fused on the mapping loop thread (the
+      # tracker's people list is not lock-protected).
+      self.create_subscription(
+        Detection3DArray, peer_ns + '/tracks',
+        self._on_peer_tracks, 10)
+      self.claim_publisher = self.create_publisher(
+        PolygonStamped, '/robot_1/maipp/task_claim', 1)
 
     # Dictionary mapping a label group name to a list of string labels.
     # In the case of a text query, the label is the query. In case of image
@@ -367,6 +485,15 @@ class MappingServer(Node):
           if self.vis is not None and r is not None:
             self.mapper.vis_query_result(r, vis_labels=v, **kwargs)
 
+        # Cache the text query set on the mapper so voxels can be classified
+        # outside the query cadence (get_class_partition -> 2D info grid).
+        if (hasattr(self.mapper, "update_query_cache")
+            and self._queries_feats.get("text", None) is not None
+            and len(self._queries_labels.get("text", [])) > 0):
+          self.mapper.update_query_cache(
+            self._queries_feats["text"], self._queries_labels["text"],
+            compressed=self.cfg.querying.compressed)
+
         self._queries_updated = False
       with self._status_lock:
         if (self.status == MappingServer.Status.IDLE and
@@ -447,6 +574,14 @@ class MappingServer(Node):
 
       self.waypoint_locked, self.target_waypoint, self.target_waypoint2 = self.behavior_manager.behavior_execute(self.behavior_mode, self.mapper, point3d_dict, self.waypoint_locked, self.publisher_dict, self.subscriber_dict)
 
+      # Drain queued person detections into tracks (cheap when empty),
+      # fusing any freshly received peer tracks first.
+      if self.person_tracker is not None:
+        while self._peer_tracks_queue:
+          self.person_tracker.fuse_peer_tracks(
+            self._peer_tracks_queue.popleft(), self.geo_frame)
+        self.person_tracker.update(self.mapper)
+
       if self.vis is not None:
         if i % self.cfg.vis.input_period == 0:
           self.mapper.vis_update(**r)
@@ -455,6 +590,29 @@ class MappingServer(Node):
 
       if i % self.cfg.querying.period == 0:
         self.run_queries()
+        # Fold new keyframe snapshots into the 2D info grid (right after
+        # run_queries so the mapper's query cache is fresh). No-op until
+        # the geo_frame home estimate is locked in.
+        # Flush pending semantic points into the global store first:
+        # update() drains snapshot seqs permanently, and frames processed
+        # since the last vox_accum_period flush would otherwise be
+        # unlabeled at vote time — their cells would stay unknown unless
+        # the camera revisits them.
+        self.mapper.accum_semantic_voxels()
+        self.info_grid.update(self.mapper)
+
+        if self.person_tracker is not None:
+          # Ground plane for detection rays: median height of the info
+          # grid's ground cells (falls back to nothing until coverage
+          # exists, which also gates projection).
+          gys = [c[2] for c in self.info_grid.info_grid.values()
+                 if c[0] == 1]
+          if gys:
+            self.person_tracker.set_ground_height(float(np.median(gys)))
+
+      # MAIPP comms run on their own wall-clock cadence (every loop
+      # iteration checks; publishes every comms_publish_period_s).
+      self.publish_maipp_comms()
 
       if self.vis is not None:
         self.vis.step()
@@ -468,11 +626,11 @@ class MappingServer(Node):
       wall_p = wall_t1 - wall_t0
       wall_thr = rgb_img.shape[0] / wall_p
       wall_t0 = wall_t1
-      logger.info("[#%4d#] Wall (#%6.4f# ms/batch - #%6.2f# frame/s), "
-                  "Mapping (#%6.4f# ms/batch - #%6.2f# frame/s), "
-                  "Mapping/Wall (#%6.4f%%)", 
-                  i, wall_p*1e3, wall_thr, map_p*1e3, map_thr,
-                  map_p/wall_p*100)
+      logger.debug("[#%4d#] Wall (#%6.4f# ms/batch - #%6.2f# frame/s), "
+                   "Mapping (#%6.4f# ms/batch - #%6.2f# frame/s), "
+                   "Mapping/Wall (#%6.4f%%)",
+                   i, wall_p*1e3, wall_thr, map_p*1e3, map_thr,
+                   map_p/wall_p*100)
 
       with self._status_lock:
         if self.status != MappingServer.Status.MAPPING:
@@ -552,6 +710,78 @@ class MappingServer(Node):
   
   def gps_callback(self, msg):
     self._latest_gps = msg
+
+  def publish_maipp_comms(self):
+    """Publishes coverage / tracks / claim + the frontier-frame TF.
+
+    Wall-clock rate-limited to comms_publish_period_s, independent of the
+    frame-driven mapping/query cycle: peer claim TTLs (~10s on the low
+    flyer) must be outrun even when the frame rate dips.
+    """
+    now = time.time()
+    if now - self._last_comms_pub < self.comms_publish_period_s:
+      return
+    self._last_comms_pub = now
+    stamp = self.get_clock().now().to_msg()
+    self.coverage_grid_publisher.publish(
+      self.info_grid.build_coverage_msg(OccupancyGrid(), stamp))
+    self.publish_frontier_frame_tf()
+    if self.person_tracker is not None:
+      tracks_msg = self.person_tracker.build_tracks_msg(
+        stamp, self.geo_frame)
+      if tracks_msg is not None:
+        self.tracks_publisher.publish(tracks_msg)
+      self.people_markers_publisher.publish(
+        self.person_tracker.build_markers_msg(stamp, Marker, MarkerArray))
+    if self.task_planner is not None:
+      # Advertise the committed task so the low flyer plans around it
+      # (empty polygon = idle; same wire format it publishes back).
+      self.claim_publisher.publish(
+        self.task_planner.build_claim_msg(PolygonStamped(), stamp))
+
+  def _on_peer_tracks(self, msg):
+    """Reduces a peer Detection3DArray to plain tuples and queues them."""
+    payload = []
+    for det in msg.detections:
+      if len(det.results) == 0:
+        continue
+      hyp = det.results[0]
+      c = hyp.pose.covariance
+      payload.append((
+        str(det.id),
+        float(hyp.pose.pose.position.x), float(hyp.pose.pose.position.y),
+        (float(c[0]), float(c[1]), float(c[6]), float(c[7])),
+        float(hyp.hypothesis.score),
+        det.header.stamp.sec + det.header.stamp.nanosec * 1e-9))
+    if payload:
+      self._peer_tracks_queue.append(payload)
+
+  def publish_frontier_frame_tf(self):
+    """Broadcasts the map -> frontier_frame transform for RViz.
+
+    'map' is the local/odom ENU frame every other RViz topic here uses. The
+    geo_frame affine maps local -> frontier frame (p_f = R p_l + t); a TF
+    parent->child transform maps child coordinates into the parent, so we
+    broadcast the inverse (p_l = R^-1 p_f - R^-1 t). The affine's geodetic
+    tilt is ~1e-4 rad at mission scale, so the rotation is sent yaw-only.
+    Re-sent (latched) each publish cycle since home refines until fixed.
+    No-op until the frame's home has been estimated.
+    """
+    if not self.geo_frame.is_ready():
+      return
+    r_inv = np.linalg.inv(self.geo_frame._affine_R)
+    t_inv = -r_inv @ self.geo_frame._affine_t
+    yaw = np.arctan2(r_inv[1, 0], r_inv[0, 0])
+    tf = TransformStamped()
+    tf.header.stamp = self.get_clock().now().to_msg()
+    tf.header.frame_id = 'map'
+    tf.child_frame_id = 'frontier_frame'
+    tf.transform.translation.x = float(t_inv[0])
+    tf.transform.translation.y = float(t_inv[1])
+    tf.transform.translation.z = float(t_inv[2])
+    tf.transform.rotation.z = float(np.sin(yaw / 2.0))
+    tf.transform.rotation.w = float(np.cos(yaw / 2.0))
+    self._tf_static_broadcaster.sendTransform(tf)
 
   def publish_frontier_boundary(self, z_disp=8.0):
     """Publish the frontier selection box as a LINE_STRIP Marker.
