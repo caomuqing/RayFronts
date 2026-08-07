@@ -36,7 +36,7 @@ import numpy as np
 import torch
 import scipy.ndimage
 
-from rayfronts.geo_frame import points_in_polygon
+from rayfronts.geo_frame import points_in_polygon, segments_cross_polygon
 
 logger = logging.getLogger(__name__)
 
@@ -152,12 +152,29 @@ class MaippTaskPlanner:
     self.claim_ttl_s = float(claim_ttl_s)
 
     self.task = None
+    # Bumped every time the committed task changes (commit or finish) so
+    # FrontierBehavior can release its waypoint lock on task changes.
+    self.task_seq = 0
     self._retired = {}     # window cell (i, j) -> retirement expiry walltime
     self._peer_cover = {}  # rid -> set of window cells (i, j)
     self._peer_claim = {}  # rid -> dict(cells=set|None, point=xy|None, t)
     self._peer_lock = threading.Lock()
+    # Receipt logging: first message per (kind, rid) logs immediately so
+    # bridge bring-up is unambiguous, then at most every peer_log_period_s.
+    self._peer_log_t = {}
+    self.peer_log_period_s = 10.0
 
   # ---------- peer message intake (ROS callback threads) ----------
+
+  def _log_peer_rx(self, kind, rid, detail):
+    """Throttled 'received from peer' log, immediate on the first message."""
+    now = time.time()
+    key = (kind, rid)
+    first = key not in self._peer_log_t
+    if first or now - self._peer_log_t[key] >= self.peer_log_period_s:
+      self._peer_log_t[key] = now
+      logger.info("[peer %d] %s%s: %s", rid, kind,
+                  " (first message)" if first else "", detail)
 
   def on_peer_cover(self, rid, msg):
     """Parses a peer nav_msgs/OccupancyGrid into window coverage cells."""
@@ -177,11 +194,21 @@ class MaippTaskPlanner:
     cells = set(zip(i[ok].tolist(), j[ok].tolist()))
     with self._peer_lock:
       self._peer_cover[rid] = cells
+    self._log_peer_rx(
+      "coverage", rid,
+      "%d cells (%d of %d grid cells in our window)"
+      % (len(cells), int(ok.sum()), rows.shape[0]))
 
   def on_peer_claim(self, rid, msg):
     """Parses a peer geometry_msgs/PolygonStamped task claim."""
     now = time.time()
     pts = [(float(p.x), float(p.y)) for p in msg.polygon.points]
+    if len(pts) == 0:
+      self._log_peer_rx("claim", rid, "released (no active task)")
+    elif len(pts) < 3:
+      self._log_peer_rx("claim", rid,
+                        "point (%.1f, %.1f)" % (pts[0][0], pts[0][1]))
+    n_claim = 0
     with self._peer_lock:
       if len(pts) == 0:
         self._peer_claim.pop(rid, None)
@@ -197,6 +224,10 @@ class MaippTaskPlanner:
         cells = set(zip((ii.reshape(-1)[inside]).tolist(),
                         (jj.reshape(-1)[inside]).tolist()))
         self._peer_claim[rid] = dict(cells=cells, point=None, t=now)
+        n_claim = len(cells)
+    if len(pts) >= 3:
+      self._log_peer_rx("claim", rid,
+                        "region polygon, %d cells in our window" % n_claim)
 
   # ---------- frame/grid helpers ----------
 
@@ -375,6 +406,7 @@ class MaippTaskPlanner:
       logger.info("Track task (person #%d) done: %s.",
                   t["track_id"], reason)
     self.task = None
+    self.task_seq += 1
 
   def _score_tasks(self, regions, robot_xy):
     """MAIPP-greedy utilities over region + track candidate tasks.
@@ -556,6 +588,7 @@ class MaippTaskPlanner:
       if task is None:
         return viewpoints_local
       self.task = task
+      self.task_seq += 1
       if task["type"] == "region":
         logger.info(
           "Task selected: explore region at (%.1f, %.1f), %.1f m^2 "
@@ -584,7 +617,17 @@ class MaippTaskPlanner:
     # Region task: viewpoints inside the region's cells if enough exist,
     # else approach via the single viewpoint closest to the centroid.
     if viewpoints_local.shape[0] == 0:
-      return viewpoints_local
+      # No frontier candidates anywhere (occupancy exploration outpaced
+      # semantic classification and consumed the frontiers). Without a
+      # goal the behavior publishes nothing and the robot hovers while
+      # region tasks cycle, so approach the region directly: hover over
+      # its centroid (or nearest admissible cell) and let re-observation
+      # classify it.
+      p_local = self._region_approach_viewpoint_local(robot_pos_local,
+                                                      mapper)
+      if p_local is None:
+        return viewpoints_local
+      return torch.tensor(p_local, dtype=torch.float).reshape(1, 3)
     ix0, iz0, _, _ = self._region_grid()
     g = self.cell_size
     cells = self.task["cells"]
@@ -602,6 +645,60 @@ class MaippTaskPlanner:
     cx, cy = self.task["centroid"]
     d_cent = np.hypot(vxy[:, 0] - cx, vxy[:, 1] - cy)
     return viewpoints_local[int(np.argmin(d_cent))].reshape(1, 3)
+
+  def _region_approach_viewpoint_local(self, robot_pos_local, mapper=None):
+    """Hover-height pseudo-viewpoint over the committed region (local frame).
+
+    Used when no frontier viewpoints exist at all. Prefers the region
+    centroid; if that is out of bounds / in a keepout (regions are built
+    from unknown cells, which include keepout interiors), falls back to
+    the admissible region cell closest to the robot. Nudged out of
+    known-occupied space like the track pseudo-viewpoint. Returns a (3,)
+    numpy array or None when no admissible point exists.
+    """
+    if self.task is None or self.task["type"] != "region":
+      return None
+    robot_fxy = self._local_to_frame_xy(
+      np.asarray(robot_pos_local, dtype=np.float64).reshape(1, 3))[0]
+
+    def path_clear(pt):
+      # This pseudo-goal is often the ONLY candidate, in which case
+      # FrontierBehavior's all-blocked fallback would publish it even if
+      # the straight line crossed a keepout zone -- so admissibility of
+      # the PATH must be enforced here, not just the goal position.
+      q = np.asarray(pt, dtype=np.float64).reshape(1, 2)
+      return not any(
+        segments_cross_polygon(robot_fxy[:2], q, poly)[0]
+        for poly in self.keepout_polygons)
+
+    fxy = None
+    cx, cy = self.task["centroid"]
+    if self._track_in_operating_area((cx, cy)) and path_clear((cx, cy)):
+      fxy = (cx, cy)
+    else:
+      ix0, iz0, _, _ = self._region_grid()
+      g = self.cell_size
+      best_d = None
+      for (i, j) in self.task["cells"]:
+        cand = ((i + ix0) * g, (j + iz0) * g)
+        if not self._track_in_operating_area(cand) or not path_clear(cand):
+          continue
+        d = math.hypot(cand[0] - robot_fxy[0], cand[1] - robot_fxy[1])
+        if best_d is None or d < best_d:
+          best_d, fxy = d, cand
+      if fxy is None:
+        # No admissible clear-path point: publish nothing. The stall
+        # timeout retires the region in <=45s, so the hover is bounded.
+        return None
+    p_local = self.geo_frame.frame_to_local(
+      np.array([fxy[0], fxy[1], 0.0], dtype=np.float64))
+    p_local = np.array([float(p_local[0]), float(p_local[1]),
+                        self.hover_height])
+    occ_at = self._make_occ_query(mapper)
+    if occ_at is not None:
+      p_local = self._safe_hover_point(
+        p_local, np.asarray(robot_pos_local, dtype=np.float64), occ_at)
+    return p_local
 
   # ---------- outgoing claim ----------
 

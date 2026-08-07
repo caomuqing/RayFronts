@@ -796,6 +796,13 @@ class MappingServer(Node):
         det.header.stamp.sec + det.header.stamp.nanosec * 1e-9))
     if payload:
       self._peer_tracks_queue.append(payload)
+      # Receipt log (throttled by the task planner's shared helper) so a
+      # working bridge is visible even when no track is newly imported.
+      if self.task_planner is not None:
+        self.task_planner._log_peer_rx(
+          "tracks", 2, "%d track(s): %s" % (
+            len(payload), ", ".join(
+              "%s@(%.1f, %.1f)" % (p[0], p[1], p[2]) for p in payload[:4])))
 
   def publish_frontier_frame_tf(self):
     """Broadcasts the map -> frontier_frame transform for RViz.

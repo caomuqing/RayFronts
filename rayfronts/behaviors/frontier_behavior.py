@@ -1,3 +1,6 @@
+import logging
+import time
+
 import torch
 from sklearn.cluster import DBSCAN
 from std_msgs.msg import Header
@@ -8,6 +11,8 @@ import numpy as np
 from geometry_msgs.msg import PoseStamped
 
 from rayfronts.geo_frame import points_in_polygon, segments_cross_polygon
+
+logger = logging.getLogger(__name__)
 
 class FrontierBehavior:
     def __init__(self, get_clock, geo_frame=None,
@@ -38,6 +43,24 @@ class FrontierBehavior:
         self.map_max_x = map_max_x
         self.map_min_y = map_min_y
         self.map_max_y = map_max_y
+        # Waypoint-lock safety: release the lock when the committed task
+        # changes (a new task must redirect the drone immediately) or when
+        # the lock is held longer than lock_timeout_s (goal unreachable).
+        self._last_task_seq = None
+        self._lock_start_t = None
+        # 45s: longer than a legitimate transit leg (~70m box at 1-2 m/s)
+        # so it does not fire mid-flight, and aligned with the region stall
+        # timeout. Task changes release the lock independently of this.
+        self.lock_timeout_s = 45.0
+        # Throttled diagnostics for cycles that publish no plan.
+        self._hold_log_t = 0.0
+
+    def _log_hold(self, reason):
+        """Logs (throttled) why this cycle published no plan."""
+        now = time.time()
+        if now - self._hold_log_t >= 5.0:
+            self._hold_log_t = now
+            logger.info("No global plan published: %s", reason)
 
     def condition_check(self, queries_labels, target_object, queries_feats, mapper, publisher_dict, subscriber_dict):
         return True
@@ -62,6 +85,7 @@ class FrontierBehavior:
 
             frontiers_cpu = transformed_frontiers.detach().cpu().numpy()
             if frontiers_cpu.shape[0] == 0:
+                self._log_hold("no frontiers in the 4-11m height band")
                 return waypoint_locked, target_waypoint, target_waypoint2
 
             #limit frontiers to the frontier-mapping frame boundary.
@@ -71,6 +95,8 @@ class FrontierBehavior:
             if self.geo_frame is None or not self.geo_frame.is_ready():
                 #home/frame transform not established yet -> cannot tell which
                 #frontiers fall inside the mission boundary, so publish nothing.
+                self._log_hold(
+                    "frontier frame home not estimated yet (waiting for GPS)")
                 return waypoint_locked, target_waypoint, target_waypoint2
             frame_xy = self.geo_frame.local_to_frame(frontiers_cpu)[:, :2]
             mask = np.ones(frame_xy.shape[0], dtype=bool)
@@ -89,6 +115,8 @@ class FrontierBehavior:
 
             frontiers_cpu = frontiers_cpu[mask]
             if frontiers_cpu.shape[0] == 0:
+                self._log_hold(
+                    "no frontiers inside mission bounds / outside keepouts")
                 return waypoint_locked, target_waypoint, target_waypoint2
 
             #DBSCAN clustering for frontier-points. min_samples=4 (not 5):
@@ -136,15 +164,36 @@ class FrontierBehavior:
                 viewpoints = self.task_planner.select(
                     viewpoints.cpu(), cur_pose_np, mapper=mapper).to(
                         dtype=transformed_frontiers.dtype)
+                # A new committed task must redirect the drone immediately:
+                # release the waypoint lock so this cycle re-selects.
+                seq = self.task_planner.task_seq
+                if seq != self._last_task_seq:
+                    if self._last_task_seq is not None and waypoint_locked:
+                        waypoint_locked = False
+                        logger.info(
+                            "Waypoint lock released: committed task changed.")
+                    self._last_task_seq = seq
+
+            # Stale-lock timeout: a goal that was never reached (blocked
+            # path, controller refusal) must not pin the drone forever.
+            if (waypoint_locked and self._lock_start_t is not None and
+                    time.time() - self._lock_start_t > self.lock_timeout_s):
+                waypoint_locked = False
+                logger.info(
+                    "Waypoint lock released: goal not reached within %.0fs.",
+                    self.lock_timeout_s)
 
             if viewpoints.shape[0] == 0:
+                self._log_hold(
+                    "no goal candidates left after task-layer selection")
                 return waypoint_locked, target_waypoint, target_waypoint2
 
             #non-crossing test: the straight line from the robot to a goal
-            #must not pass through a keepout zone. Drop blocked candidates
-            #(the goal itself may be legal while the direct path is not).
-            #Skipped if every candidate is blocked, so a committed task's only
-            #viewpoint still yields a goal rather than stalling the behavior.
+            #must not pass through a keepout zone. Strict: blocked candidates
+            #are always dropped (the goal itself may be legal while the
+            #direct path is not), and an all-blocked set publishes nothing.
+            #The hold is bounded: the task layer's stall/time budget retires
+            #the committed task within <=60s and rotates to a reachable one.
             if self.keepout_polygons and viewpoints.shape[0] > 0:
                 vp_np = viewpoints.detach().cpu().numpy()
                 vp_frame_xy = self.geo_frame.local_to_frame(vp_np)[:, :2]
@@ -154,8 +203,12 @@ class FrontierBehavior:
                 for poly in self.keepout_polygons:
                     blocked |= segments_cross_polygon(
                         robot_frame_xy, vp_frame_xy, poly)
-                if not blocked.all():
-                    viewpoints = viewpoints[torch.from_numpy(~blocked)]
+                if blocked.all():
+                    self._log_hold(
+                        "all %d candidate paths cross a keepout zone"
+                        % viewpoints.shape[0])
+                    return waypoint_locked, target_waypoint, target_waypoint2
+                viewpoints = viewpoints[torch.from_numpy(~blocked)]
 
             cent_msg = self.create_pointcloud2_msg(viewpoints)
             viewpoint_publisher.publish(cent_msg)
@@ -188,6 +241,7 @@ class FrontierBehavior:
             if not waypoint_locked:
                 best_cent_np = best_cent.cpu().numpy()
                 target_waypoint = best_cent_np
+                self._lock_start_t = time.time()
                 direction = target_waypoint - cur_pose_np
                 direction = direction / np.linalg.norm(target_waypoint - cur_pose_np)
                 target_waypoint2 = target_waypoint + 1.0*direction
