@@ -15,7 +15,8 @@ class BehaviorManager:
     def __init__(self, get_clock, geo_frame=None,
                  map_min_x=None, map_max_x=None,
                  map_min_y=None, map_max_y=None,
-                 keepout_polygons=None):
+                 keepout_polygons=None,
+                 enable_ray_behavior=False):
         self.behavior_mode = 'Frontier-based'
         self.get_clock = get_clock
         #self.voxel_behavior = VoxelBehavior(self.get_clock)
@@ -25,7 +26,13 @@ class BehaviorManager:
             map_min_x=map_min_x, map_max_x=map_max_x,
             map_min_y=map_min_y, map_max_y=map_max_y,
             keepout_polygons=keepout_polygons)
-        self.behaviors = [self.ray_behavior, self.frontier_behavior]
+        # Ray behavior chases semantic ray matches to the target objects and
+        # bypasses the frontier-frame boundary/keepout gating, so it is off by
+        # default; set enable_ray_behavior=True to restore it.
+        if enable_ray_behavior:
+            self.behaviors = [self.ray_behavior, self.frontier_behavior]
+        else:
+            self.behaviors = [self.frontier_behavior]
 
     def set_task_planner(self, task_planner):
         """Attaches the MAIPP task layer to frontier viewpoint selection."""

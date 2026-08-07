@@ -56,11 +56,11 @@ class MaippTaskPlanner:
                region_min_area_m2=25.0,
                region_max_area_m2=400.0,
                region_min_viewpoints=1,
-               region_coverage_done=0.85,
+               region_coverage_done=0.80,
                region_time_budget_s=60.0,
-               region_retire_cooldown_s=180.0,
+               region_retire_cooldown_s=120.0,
                region_stall_timeout_s=45.0,
-               region_stall_cooldown_s=360.0,
+               region_stall_cooldown_s=180.0,
                target_birth_density=0.01,
                task_w_mass=1.0,
                task_w_prob=0.5,
@@ -68,6 +68,7 @@ class MaippTaskPlanner:
                task_w_cov=0.2,
                task_w_stale=0.005,
                task_w_travel=0.05,
+               task_w_xbias=0.0,
                track_task_min_existence=0.3,
                track_task_min_sigma=0.8,
                track_task_min_unseen_s=240.0,
@@ -108,6 +109,10 @@ class MaippTaskPlanner:
       target_birth_density: Undetected-target birth prior (targets/m^2)
         for region scoring.
       task_w_*: MAIPP-greedy score weights (see _score_tasks).
+      task_w_xbias: Directional preference (score units per meter of
+        frontier-frame x) added to every candidate's utility as
+        w_xbias * x. Positive values bias task selection toward the
+        +x side of the operating area; 0 disables.
       track_task_min_existence / min_sigma / min_unseen_s: A track is worth
         revisiting once fairly believed, grown uncertain, and unseen for a
         while.
@@ -139,6 +144,7 @@ class MaippTaskPlanner:
     self.task_w_cov = float(task_w_cov)
     self.task_w_stale = float(task_w_stale)
     self.task_w_travel = float(task_w_travel)
+    self.task_w_xbias = float(task_w_xbias)
     self.track_task_min_existence = float(track_task_min_existence)
     self.track_task_min_sigma = float(track_task_min_sigma)
     self.track_task_min_unseen_s = float(track_task_min_unseen_s)
@@ -389,7 +395,8 @@ class MaippTaskPlanner:
       lam = self.target_birth_density * len(cells) * cell_area
       score = (self.task_w_mass * lam
                + self.task_w_prob * (1.0 - math.exp(-lam))
-               - self.task_w_travel * dist)
+               - self.task_w_travel * dist
+               + self.task_w_xbias * cx)
       cands.append((score, dict(type="region", cells=cells,
                                 centroid=(cx, cy), t_start=now,
                                 best_cov=0.0, last_progress_t=now)))
@@ -408,7 +415,8 @@ class MaippTaskPlanner:
       score = (self.task_w_exist * p["existence"]
                + self.task_w_cov * float(torch.trace(p["cov"]))
                + self.task_w_stale * (now - p["last_seen"])
-               - self.task_w_travel * dist)
+               - self.task_w_travel * dist
+               + self.task_w_xbias * pxy[0])
       cands.append((score, dict(type="track", track_id=p["track_id"],
                                 t_start=now, start_n_obs=p["n_obs"])))
     if len(cands) == 0:

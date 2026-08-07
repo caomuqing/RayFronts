@@ -474,6 +474,10 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
     # to project a smaller number of rays at lower resolution to reduce
     # object semantics leaking at the boundaries.
 
+    # max_rays_per_frame == 0 disables semantic ray generation/accumulation
+    # entirely (each stored ray carries a full feature vector, so the global
+    # ray store dominates RAM on long runs when rays are not being used).
+    gen_rays = not self.global_encoding and self.max_dirs_per_frame != 0
     r = g3d.depth_to_sparse_occupancy_voxels(
       depth_img, pose_4x4, self.intrinsics_3x3, self.vox_size, conf_map,
       max_num_pts = self.max_pts_per_frame,
@@ -481,12 +485,17 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
       max_num_dirs = self.max_dirs_per_frame,
       max_depth_sensing = self.max_depth_sensing,
       occ_thickness=self.occ_thickness,
-      return_pc=True, return_dirs= not self.global_encoding,
+      return_pc=True, return_dirs=gen_rays,
       dirs_erosion=self.ray_erosion,
     )
-    if not self.global_encoding:
+    if gen_rays:
       vox_xyz, vox_occ, pc_xyz, selected_pc_ind, \
         origs, dirs, selected_dir_ind = r
+    elif not self.global_encoding:
+      # Rays disabled: occupancy + semantic voxels + frontiers only.
+      vox_xyz, vox_occ, pc_xyz, selected_pc_ind = r
+      origs = torch.zeros((0, 3), dtype=torch.float, device=self.device)
+      dirs = torch.zeros((0, 3), dtype=torch.float, device=self.device)
     else:
       vox_xyz, vox_occ, pc_xyz, selected_pc_ind = r
       origs = torch.zeros(pose_4x4.shape[0], 1, 3,
@@ -523,7 +532,7 @@ class SemanticRayFrontiersMap(SemanticRGBDMapping):
       feat_img_flat = feat_img.permute(0, 2, 3, 1).reshape(-1,
                                                            feat_img.shape[1])
 
-      dirs_feat = feat_img_flat[selected_dir_ind]
+      dirs_feat = feat_img_flat[selected_dir_ind] if gen_rays else None
       pts_feat = feat_img_flat[selected_pc_ind]
       del feat_img_flat
 

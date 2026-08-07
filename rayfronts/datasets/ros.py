@@ -158,7 +158,13 @@ class Ros2Subscriber(PosedRgbdDataset):
       if t is not None:
         self._subs[msg_str] = message_filters.Subscriber(
           self._rosnode, msg_str_to_type[msg_str], t, qos_profile = 10)
-    self._frame_msgs_queue = queue.Queue()
+    # Bounded: raw (full-resolution) frame messages wait here until the
+    # mapping loop consumes them. Unbounded, a mapper slower than the
+    # (post-frame_skip) arrival rate accumulates frames without limit and
+    # eventually exhausts system RAM; when full, the oldest frame is dropped
+    # so mapping always works on near-live data (see _buffer_frame_msgs).
+    self._frame_msgs_queue = queue.Queue(maxsize=8)
+    self._dropped_frames = 0
 
     self._time_sync = message_filters.ApproximateTimeSynchronizer(
       list(self._subs.values()), queue_size = 10, slop = 0.01,
@@ -219,7 +225,23 @@ class Ros2Subscriber(PosedRgbdDataset):
 
   def _buffer_frame_msgs(self, *msgs):
     if self.frame_skip <= 0 or self.f % (self.frame_skip+1) == 0:
-      self._frame_msgs_queue.put(msgs)
+      while True:
+        try:
+          self._frame_msgs_queue.put_nowait(msgs)
+          break
+        except queue.Full:
+          # Mapper is behind; drop the oldest buffered frame so memory stays
+          # bounded and the map tracks near-live data.
+          try:
+            self._frame_msgs_queue.get_nowait()
+            self._dropped_frames += 1
+            if self._dropped_frames % 100 == 1:
+              logger.warning(
+                "Input frame queue full (mapping slower than input rate); "
+                "dropped oldest frame (%d dropped so far).",
+                self._dropped_frames)
+          except queue.Empty:
+            pass
     self.f += 1
 
   def __iter__(self):

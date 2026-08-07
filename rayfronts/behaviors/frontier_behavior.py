@@ -7,7 +7,7 @@ from nav_msgs.msg import Path
 import numpy as np
 from geometry_msgs.msg import PoseStamped
 
-from rayfronts.geo_frame import points_in_polygon
+from rayfronts.geo_frame import points_in_polygon, segments_cross_polygon
 
 class FrontierBehavior:
     def __init__(self, get_clock, geo_frame=None,
@@ -139,6 +139,23 @@ class FrontierBehavior:
 
             if viewpoints.shape[0] == 0:
                 return waypoint_locked, target_waypoint, target_waypoint2
+
+            #non-crossing test: the straight line from the robot to a goal
+            #must not pass through a keepout zone. Drop blocked candidates
+            #(the goal itself may be legal while the direct path is not).
+            #Skipped if every candidate is blocked, so a committed task's only
+            #viewpoint still yields a goal rather than stalling the behavior.
+            if self.keepout_polygons and viewpoints.shape[0] > 0:
+                vp_np = viewpoints.detach().cpu().numpy()
+                vp_frame_xy = self.geo_frame.local_to_frame(vp_np)[:, :2]
+                robot_frame_xy = self.geo_frame.local_to_frame(
+                    np.asarray(cur_pose_np, dtype=np.float64))[:2]
+                blocked = np.zeros(vp_frame_xy.shape[0], dtype=bool)
+                for poly in self.keepout_polygons:
+                    blocked |= segments_cross_polygon(
+                        robot_frame_xy, vp_frame_xy, poly)
+                if not blocked.all():
+                    viewpoints = viewpoints[torch.from_numpy(~blocked)]
 
             cent_msg = self.create_pointcloud2_msg(viewpoints)
             viewpoint_publisher.publish(cent_msg)

@@ -9,6 +9,8 @@ HYDRA_FULL_ERROR=1 python3 -m rayfronts.mapping_server_rosnode \
 	dataset.rgb_resolution=[320,320] \
 	dataset.depth_resolution=[320,320] \
 	dataset.frame_skip=2 \
-	mapping.max_rays_per_frame=10000 
+	mapping.max_rays_per_frame=0 \
+	mapping.max_pts_per_frame=20000 \
+	mapping.vox_accum_period=4
 
 

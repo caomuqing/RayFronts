@@ -17,7 +17,11 @@ estimated online from GPS + odometry (see ``update_home``) exactly as the
 compass planner does, then locked once successive estimates agree.
 """
 
+import logging
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # WGS84 ellipsoid constants
 _WGS84_A = 6378137.0          # semi-major axis (m)
@@ -105,6 +109,51 @@ def points_in_polygon(pts_xy, poly_xy):
               (x < (x2 - x1) * (y - y1) / (y2 - y1) + x1)
     inside ^= crosses
   return inside
+
+
+def segments_cross_polygon(p0_xy, pts_xy, poly_xy):
+  """Whether the segment p0 -> each point intersects a polygon.
+
+  A segment "crosses" the polygon if it intersects any polygon edge or if
+  either endpoint lies inside it (a segment fully contained in the polygon
+  touches no edge). Vectorized over the query points.
+
+  Args:
+    p0_xy: (2,) shared start point (e.g. the robot position).
+    pts_xy: (N, 2) segment end points (e.g. candidate goals).
+    poly_xy: (M, 2) polygon vertices in order.
+  Returns:
+    (N,) bool array, True where the segment is blocked by the polygon.
+  """
+  p0_xy = np.asarray(p0_xy, dtype=np.float64).reshape(2)
+  pts_xy = np.asarray(pts_xy, dtype=np.float64).reshape(-1, 2)
+  poly_xy = np.asarray(poly_xy, dtype=np.float64)
+  n = pts_xy.shape[0]
+  blocked = np.zeros(n, dtype=bool)
+  if n == 0:
+    return blocked
+
+  # Either endpoint inside the polygon blocks the segment.
+  blocked |= points_in_polygon(pts_xy, poly_xy)
+  if points_in_polygon(p0_xy.reshape(1, 2), poly_xy)[0]:
+    return np.ones(n, dtype=bool)
+
+  def cross(ox, oy, ax, ay, bx, by):
+    return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
+
+  m = poly_xy.shape[0]
+  ax, ay = p0_xy[0], p0_xy[1]
+  bx, by = pts_xy[:, 0], pts_xy[:, 1]
+  for i in range(m):
+    cx, cy = poly_xy[i]
+    dx, dy = poly_xy[(i + 1) % m]
+    # Proper (non-degenerate) segment intersection via orientation signs.
+    d1 = cross(cx, cy, dx, dy, ax, ay)
+    d2 = cross(cx, cy, dx, dy, bx, by)
+    d3 = cross(ax, ay, bx, by, cx, cy)
+    d4 = cross(ax, ay, bx, by, dx, dy)
+    blocked |= (((d1 > 0) != (d2 > 0)) & ((d3 > 0) != (d4 > 0)))
+  return blocked
 
 
 class FrontierFrame:
@@ -201,6 +250,20 @@ class FrontierFrame:
       change = float(np.linalg.norm(home_ecef - prev))
       if change < self._home_lock_thresh:
         self.home_fixed = True
+        logger.info(
+          "Frontier frame home FIXED: lat=%.6f lon=%.6f alt=%.1f m "
+          "(change=%.3f m < %.2f m). Local/odom frame is now anchored to "
+          "global coordinates; frontier selection boundary active.",
+          lat, lon, alt, change, self._home_lock_thresh)
+      else:
+        logger.debug(
+          "Frontier frame home estimate: lat=%.6f lon=%.6f alt=%.1f m "
+          "(change=%.3f m >= %.2f m, not locked yet).",
+          lat, lon, alt, change, self._home_lock_thresh)
+    else:
+      logger.debug(
+        "Frontier frame home first estimate: lat=%.6f lon=%.6f alt=%.1f m.",
+        lat, lon, alt)
     return self.home_fixed
 
   def set_home(self, lat_deg, lon_deg, alt_m):
@@ -218,6 +281,10 @@ class FrontierFrame:
     self.origin_alt = float(alt_m)
     self._recompute_affine()
     self.home_fixed = True
+    logger.info(
+      "Frontier frame home FIXED (surveyed): lat=%.6f lon=%.6f alt=%.1f m. "
+      "Local/odom frame is now anchored to global coordinates.",
+      self._home_lat, self._home_lon, self._home_alt)
 
   def _local_to_frame_exact(self, pos_local):
     """Exact single-point local(ENU@home) -> frontier-frame transform."""

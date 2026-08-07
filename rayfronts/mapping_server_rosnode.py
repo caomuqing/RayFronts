@@ -128,7 +128,7 @@ class MappingServer(Node):
     # self.map_min_x, self.map_max_x = -34.86, 37.33
     # self.map_min_y, self.map_max_y = -32.09, 29.82
     self.map_min_x, self.map_max_x = -34.86, 34.33
-    self.map_min_y, self.map_max_y = -20.09, 15.82
+    self.map_min_y, self.map_max_y = -20.09, 7.82
 
     # Keepout zones (surveyed corners, WGS84; see bound_coordinates). No
     # frontier inside these polygons may be chosen for the global plan. They
@@ -191,6 +191,12 @@ class MappingServer(Node):
     self.waypoint_locked = False
     self.target_waypoint = None
     self.target_waypoint2 = None
+
+    # Frontier/task behavior stays dormant until the robot's odometry
+    # altitude first exceeds this (i.e. after takeoff), then latches on.
+    # Mapping / home estimation / person tracking run regardless.
+    self.behavior_start_altitude = 6.0
+    self.behavior_active = False
 
     self.behavior_mode = 'Frontier-based'
 
@@ -321,7 +327,10 @@ class MappingServer(Node):
         tracker=self.person_tracker,
         robot_id=1,
         hover_height=8.0,
-        keepout_polygons=self.keepout_polygons)
+        keepout_polygons=self.keepout_polygons,
+        # Soft preference for tasks on the +x side of the frontier frame
+        # (score units per meter of frame x; see task_w_xbias docstring).
+        task_w_xbias=0.10)
       self.behavior_manager.set_task_planner(self.task_planner)
       peer_ns = '/robot_2/maipp'
       self.create_subscription(
@@ -559,20 +568,30 @@ class MappingServer(Node):
       r = self.mapper.process_posed_rgbd(rgb_img, depth_img, pose_4x4, **kwargs)
       map_t1 = time.time()
 
-      #behavior manager selects mode
-      self.behavior_manager.mode_select(queries_labels=self._queries_labels,target_objects = self._target_objects, queries_feats = self._queries_feats, mapper=self.mapper, publisher_dict=self.publisher_dict, subscriber_dict=self.subscriber_dict)
+      # Takeoff trigger: frontier/task behavior starts only once the robot
+      # first climbs above behavior_start_altitude, then stays active.
+      if not self.behavior_active and \
+         cur_pose_np[2] > self.behavior_start_altitude:
+        self.behavior_active = True
+        logger.info(
+          "Robot altitude %.1f m > %.1f m: starting frontier/task selection "
+          "behavior.", cur_pose_np[2], self.behavior_start_altitude)
 
-      if self.behavior_mode != self.behavior_manager.behavior_mode:
-          self.mode_switch_trigger()
+      if self.behavior_active:
+        #behavior manager selects mode
+        self.behavior_manager.mode_select(queries_labels=self._queries_labels,target_objects = self._target_objects, queries_feats = self._queries_feats, mapper=self.mapper, publisher_dict=self.publisher_dict, subscriber_dict=self.subscriber_dict)
 
-      self.behavior_mode = self.behavior_manager.behavior_mode
+        if self.behavior_mode != self.behavior_manager.behavior_mode:
+            self.mode_switch_trigger()
 
-      #RVIZ visualizer for /mode_text
-      #self.modeTextVisualize(cur_pose_np, self._target_object, self.behavior_mode)
+        self.behavior_mode = self.behavior_manager.behavior_mode
 
-      point3d_dict = {'cur_pose': cur_pose_np, 'target1': self.target_waypoint, 'target2': self.target_waypoint2}
+        #RVIZ visualizer for /mode_text
+        #self.modeTextVisualize(cur_pose_np, self._target_object, self.behavior_mode)
 
-      self.waypoint_locked, self.target_waypoint, self.target_waypoint2 = self.behavior_manager.behavior_execute(self.behavior_mode, self.mapper, point3d_dict, self.waypoint_locked, self.publisher_dict, self.subscriber_dict)
+        point3d_dict = {'cur_pose': cur_pose_np, 'target1': self.target_waypoint, 'target2': self.target_waypoint2}
+
+        self.waypoint_locked, self.target_waypoint, self.target_waypoint2 = self.behavior_manager.behavior_execute(self.behavior_mode, self.mapper, point3d_dict, self.waypoint_locked, self.publisher_dict, self.subscriber_dict)
 
       # Drain queued person detections into tracks (cheap when empty),
       # fusing any freshly received peer tracks first.
@@ -613,6 +632,28 @@ class MappingServer(Node):
       # MAIPP comms run on their own wall-clock cadence (every loop
       # iteration checks; publishes every comms_publish_period_s).
       self.publish_maipp_comms()
+
+      # Memory housekeeping: on Jetson unified memory, torch's caching
+      # allocator holds freed blocks indefinitely and fragments across the
+      # accumulation cycles' large transient tensors, ratcheting RSS upward.
+      # empty_cache() actually returns those blocks to the OS here.
+      if i % 50 == 0 and i > 0:
+        torch.cuda.empty_cache()
+      if i % 100 == 0:
+        try:
+          with open("/proc/self/statm") as f:
+            rss_gb = int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e9
+          n_vox = (0 if self.mapper.global_vox_xyz is None
+                   else self.mapper.global_vox_xyz.shape[0])
+          n_rays = (0 if getattr(self.mapper, "global_rays_orig_angles", None)
+                    is None else self.mapper.global_rays_orig_angles.shape[0])
+          logger.info(
+            "[mem] RSS %.1f GB | cuda alloc %.1f / reserved %.1f GB | "
+            "sem vox %d | rays %d", rss_gb,
+            torch.cuda.memory_allocated() / 1e9,
+            torch.cuda.memory_reserved() / 1e9, n_vox, n_rays)
+        except Exception:
+          pass
 
       if self.vis is not None:
         self.vis.step()
