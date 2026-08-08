@@ -6,6 +6,7 @@ Typical usage:
   vis.log_img(img, layer="rgb_img", pose_layer="cam0")
   vis.step()
 """
+import os
 from typing_extensions import override
 from typing import Tuple
 
@@ -59,7 +60,20 @@ class RerunVis(Mapping3DVisualizer):
     super().__init__(intrinsics_3x3, img_size, base_point_size,
                      global_heat_scale, feat_compressor)
 
-    rr.init("semantic_mapping_vis", spawn=True)
+    # Per-robot viewer: multiple robots on one machine each get their own
+    # rerun instance (port 9874 + ROBOT_ID), otherwise the second planner
+    # silently connects to the first robot's viewer and the streams mix.
+    rid = os.environ.get("ROBOT_ID")
+    port = int(os.environ.get(
+      "RAYFRONTS_RERUN_PORT",
+      str(9876 if rid is None else 9874 + int(rid))))
+    # Viewer RAM cap (oldest timeline data is dropped when hit). The rerun
+    # default of 75% of system RAM is fine solo but overcommits when two
+    # robots run their own viewers on one machine.
+    mem = os.environ.get("RAYFRONTS_RERUN_MEMLIMIT",
+                         "75%" if rid is None else "30%")
+    rr.init("semantic_mapping_vis" + ("" if rid is None else f"_robot{rid}"))
+    rr.spawn(port=port, connect=True, memory_limit=mem)
     _set_rerun_time("stable_time", 0)
     self._base_name = "world"
     rr.log(self._base_name, rr.ViewCoordinates.RDF, static=True)

@@ -1,0 +1,32 @@
+# MAIPP bridge, robot_2 (domain 2) <-> domain 1 (high-flyer robot_1).
+# Ownership convention: each robot's bridges send its OWN maipp topics to
+# the other two domains; since the high-flyer runs no bridge, each
+# low-flyer also pulls robot_1's topics into its own domain. One config
+# file per counterpart domain because a YAML key (the topic) can only
+# carry one from/to pair.
+name: maipp_robot2_d1
+topics:
+  /robot_2/maipp/coverage_grid:
+    type: nav_msgs/msg/OccupancyGrid
+    from_domain: 2
+    to_domain: 1
+  /robot_2/maipp/task_claim:
+    type: geometry_msgs/msg/PolygonStamped
+    from_domain: 2
+    to_domain: 1
+  /robot_2/maipp/tracks:
+    type: vision_msgs/msg/Detection3DArray
+    from_domain: 2
+    to_domain: 1
+  /robot_1/maipp/coverage_grid:
+    type: nav_msgs/msg/OccupancyGrid
+    from_domain: 1
+    to_domain: 2
+  /robot_1/maipp/task_claim:
+    type: geometry_msgs/msg/PolygonStamped
+    from_domain: 1
+    to_domain: 2
+  /robot_1/maipp/tracks:
+    type: vision_msgs/msg/Detection3DArray
+    from_domain: 1
+    to_domain: 2

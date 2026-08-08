@@ -1,0 +1,28 @@
+# MAIPP bridge, robot_3 (domain 3) <-> domain 1 (high-flyer robot_1).
+# See maipp_robot2_d1.yaml for the fleet ownership convention.
+name: maipp_robot3_d1
+topics:
+  /robot_3/maipp/coverage_grid:
+    type: nav_msgs/msg/OccupancyGrid
+    from_domain: 3
+    to_domain: 1
+  /robot_3/maipp/task_claim:
+    type: geometry_msgs/msg/PolygonStamped
+    from_domain: 3
+    to_domain: 1
+  /robot_3/maipp/tracks:
+    type: vision_msgs/msg/Detection3DArray
+    from_domain: 3
+    to_domain: 1
+  /robot_1/maipp/coverage_grid:
+    type: nav_msgs/msg/OccupancyGrid
+    from_domain: 1
+    to_domain: 3
+  /robot_1/maipp/task_claim:
+    type: geometry_msgs/msg/PolygonStamped
+    from_domain: 1
+    to_domain: 3
+  /robot_1/maipp/tracks:
+    type: vision_msgs/msg/Detection3DArray
+    from_domain: 1
+    to_domain: 3

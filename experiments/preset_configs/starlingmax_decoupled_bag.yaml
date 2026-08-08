@@ -137,11 +137,11 @@ exploration:
   # detection) before existence drops below person_exist_remove; fresh
   # low-confidence tracks die faster.
   person_p_detect: 0.7
-  # Multi-robot MAIPP comms: this starling is robot_2; the high-flyer
-  # (robot_1) contributes coverage/tracks/claims on /robot_1/maipp/*
-  # (see default.yaml for the protocol).
+  # Multi-robot MAIPP comms (see default.yaml for the protocol). Defaults
+  # for robot_2; run_mapping_exploration.sh overrides robot_id and
+  # peer_robot_ids per robot on the command line (robot_3 gets [1, 2]).
   robot_id: 2
-  peer_robot_ids: [1]
+  peer_robot_ids: [1, 3]
   # Work the western part of the map first: any task with frame x <= -15
   # strictly precedes tasks outside that zone.
   task_priority_zone: [null, -15.0, null, null]
@@ -169,26 +169,32 @@ exploration:
   ff_map_max_x: 34.33
   ff_map_min_y: -20.09
   ff_map_max_y: 7.82
-  # Georeference of the Starling's local NED odometry: FILL PER TAKEOFF.
-  #   ned_origin_lat/lon/alt: WGS84 position of the odometry origin (where
-  #     the drone sat when odometry initialized).
-  #   ned_heading_deg: compass azimuth in degrees CLOCKWISE FROM TRUE NORTH
-  #     of the local NED +x axis (the direction the drone faced at init).
+  # Per-robot georeference of the local NED odometry: FILL PER TAKEOFF.
+  # The ned_origins entry matching this run's robot_id wins (the flat
+  # ned_origin_* keys in default.yaml remain as a single-robot fallback).
+  #   lat/lon/alt: WGS84 position of the odometry origin (where the drone
+  #     sat when odometry initialized).
+  #   heading_deg: compass azimuth in degrees CLOCKWISE FROM TRUE NORTH of
+  #     the local NED +x axis (the direction the drone faced at init).
   # NOTE the convention differs from ff_heading_deg, which is degrees CCW
   # FROM EAST (the high-flyer's convention). Do NOT copy ff_heading_deg
-  # here: if the drone faces along the frame's X axis at init, the correct
-  # value is ned_heading_deg = 90 - ff_heading_deg.
-  # Left null, the planner warns and falls back to the local
+  # here: facing along the frame's X axis at init means
+  # heading_deg = 90 - ff_heading_deg. The frames always relate as
+  # frame_x = ned_x, frame_y = -ned_y when aligned (NED is z-down with +y
+  # right of +x; the frontier frame is ENU z-up with +Y left of +X).
+  # With no usable entry, the planner warns and falls back to the local
   # xmin/xmax/ymin/ymax bounds below.
-  # Current values: bag-testing placeholder putting the local origin at the
-  # frame origin, facing along the frame X axis. The frames then relate as
-  # frame_x = ned_x, frame_y = -ned_y — the y axis ALWAYS mirrors between
-  # the two (NED is z-down with +y right of +x; the frontier frame is
-  # ENU-based z-up with +Y left of +X); no heading choice removes that.
-  ned_origin_lat: 40.41329   # takeoff spot
-  ned_origin_lon: -79.94657  # (79.94657 W -> negative)
-  ned_origin_alt: 0.0
-  ned_heading_deg: 166.17  # = 90 - ff_heading_deg = 90 - (-76.17)
+  ned_origins:
+    robot2:
+      lat: 40.41329
+      lon: -79.94657
+      alt: 0.0
+      heading_deg: 166.17  # = 90 - ff_heading_deg = 90 - (-76.17)
+    robot3:
+      lat: 40.41339        # FILL: robot_3's own takeoff spot + heading
+      lon: -79.94697       # (currently copies robot2's values)
+      alt: 0.0
+      heading_deg: 166.17
   # Local-frame fallback bounds (pose frame), used only when the frontier
   # frame is not fully configured.
   xmin: -100.0

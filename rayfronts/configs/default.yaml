@@ -280,6 +280,10 @@ exploration:
   ned_origin_lon: null
   ned_origin_alt: 0.0
   ned_heading_deg: 0.0
+  # Per-robot georeference map: an entry keyed "robot<id>" (fields lat,
+  # lon, alt, heading_deg) overrides the flat ned_origin_* values for that
+  # robot_id, so one preset carries every robot's takeoff parameters.
+  ned_origins: null
   # Exploration xy bounds, in the POSE-TOPIC world frame (e.g. PX4 NED map:
   # x north-ish, y east-ish — the same frame goals are published in). Outside
   # [xmin, xmax] x [ymin, ymax]: class-specific frontiers are not generated

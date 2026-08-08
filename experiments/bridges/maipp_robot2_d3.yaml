@@ -1,0 +1,16 @@
+# MAIPP bridge, robot_2 outbound to domain 3 (robot_3). The reverse
+# direction (robot_3 -> domain 2) is owned by robot_3's bridges.
+name: maipp_robot2_d3
+topics:
+  /robot_2/maipp/coverage_grid:
+    type: nav_msgs/msg/OccupancyGrid
+    from_domain: 2
+    to_domain: 3
+  /robot_2/maipp/task_claim:
+    type: geometry_msgs/msg/PolygonStamped
+    from_domain: 2
+    to_domain: 3
+  /robot_2/maipp/tracks:
+    type: vision_msgs/msg/Detection3DArray
+    from_domain: 2
+    to_domain: 3

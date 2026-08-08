@@ -399,12 +399,29 @@ class ExplorationPlanner:
     self.bounds_rdf = None
 
     ff_lat = cfg.get("ff_origin_lat", None)
-    ned_lat = cfg.get("ned_origin_lat", None)
+    # Georeference of the local NED odometry: flat ned_origin_* values,
+    # overridden per robot by a matching ned_origins["robot<id>"] entry so
+    # one preset carries every robot's takeoff parameters.
+    ned = dict(lat=cfg.get("ned_origin_lat", None),
+               lon=cfg.get("ned_origin_lon", None),
+               alt=cfg.get("ned_origin_alt", 0.0),
+               heading_deg=cfg.get("ned_heading_deg", 0.0))
+    origins = cfg.get("ned_origins", None)
+    rid = int(cfg.get("robot_id", 0))
+    if origins is not None and rid > 0:
+      entry = origins.get("robot%d" % rid, None)
+      if entry is not None:
+        for k in ned:
+          v = entry.get(k, None)
+          if v is not None:
+            ned[k] = v
+        logger.info("Using georeference ned_origins.robot%d.", rid)
+    ned_lat = ned["lat"]
     if ff_lat is not None and ned_lat is None:
       logger.warning(
         "Frontier frame configured (ff_origin_lat) but the local NED "
-        "georeference (ned_origin_lat/lon/heading) is missing; falling "
-        "back to local bounds.")
+        "georeference (ned_origin_lat/lon/heading or a ned_origins entry "
+        "for robot_%d) is missing; falling back to local bounds.", rid)
       ff_lat = None
 
     if ff_lat is not None:
@@ -413,11 +430,10 @@ class ExplorationPlanner:
         origin_lon=float(cfg.ff_origin_lon),
         origin_alt=float(cfg.get("ff_origin_alt", 0.0)),
         heading_deg=float(cfg.get("ff_heading_deg", 0.0)))
-      ff.set_home(float(ned_lat), float(cfg.ned_origin_lon),
-                  float(cfg.get("ned_origin_alt", 0.0)))
+      ff.set_home(float(ned_lat), float(ned["lon"]), float(ned["alt"]))
       # Local NED -> ENU at the local origin: +x points at compass azimuth
       # psi (CW from true north), +y is 90deg right of it, +z is down.
-      psi = math.radians(float(cfg.get("ned_heading_deg", 0.0)))
+      psi = math.radians(float(ned["heading_deg"]))
       r_n2e = np.array([[math.sin(psi), math.cos(psi), 0.0],
                         [math.cos(psi), -math.sin(psi), 0.0],
                         [0.0, 0.0, -1.0]])
@@ -439,7 +455,7 @@ class ExplorationPlanner:
         "NED origin (%.6f, %.6f) heading %.2fdeg sits at frame (%.1f, %.1f)"
         "; map bounds x [%.1f, %.1f], y [%.1f, %.1f].",
         ff.origin_lat, ff.origin_lon, ff.heading_deg, float(ned_lat),
-        float(cfg.ned_origin_lon), float(cfg.get("ned_heading_deg", 0.0)),
+        float(ned["lon"]), float(ned["heading_deg"]),
         float(self._grid_t[0]), float(self._grid_t[1]), *self.grid_bounds)
     else:
       # Legacy: bounds in the pose-topic (NED) frame; grid xy = RDF (x, z).
