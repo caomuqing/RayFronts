@@ -8,7 +8,7 @@ docker run -it --rm \
 	--privileged \
 	--runtime=nvidia \
 	-e NVIDIA_DRIVER_CAPABILITIES=all \
-	-e ROS_DOMAIN_ID=0 \
+	-e ROS_DOMAIN_ID=2 \
 	-e DISPLAY="${DISPLAY:-:1}" \
 	-v /tmp/.X11-unix:/tmp/.X11-unix \
 	-v /home/airstationminipro/muqing_ws/rayfronts:/workspace/RayFronts \

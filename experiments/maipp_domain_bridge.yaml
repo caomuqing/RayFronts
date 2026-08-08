@@ -1,0 +1,34 @@
+# MAIPP multi-robot task coordination bridge (robot_1 <-> robot_2).
+# Each robot publishes its explored-cell coverage grid, its committed task
+# claim, and its person tracks; the peer subscribes to all three to avoid
+# duplicating coverage/tasks and to fuse tracks. Bidirectional, so every
+# topic needs its own entry in each direction.
+#
+# robot_1 (high-flyer) lives on ROS_DOMAIN_ID 1; robot_2 (starling) on 2.
+# Run with:  ros2 run domain_bridge domain_bridge experiments/maipp_domain_bridge.yaml
+name: maipp_bridge
+topics:
+  /robot_1/maipp/coverage_grid:
+    type: nav_msgs/msg/OccupancyGrid
+    from_domain: 1
+    to_domain: 2
+  /robot_1/maipp/task_claim:
+    type: geometry_msgs/msg/PolygonStamped
+    from_domain: 1
+    to_domain: 2
+  /robot_1/maipp/tracks:
+    type: vision_msgs/msg/Detection3DArray
+    from_domain: 1
+    to_domain: 2
+  /robot_2/maipp/coverage_grid:
+    type: nav_msgs/msg/OccupancyGrid
+    from_domain: 2
+    to_domain: 1
+  /robot_2/maipp/task_claim:
+    type: geometry_msgs/msg/PolygonStamped
+    from_domain: 2
+    to_domain: 1
+  /robot_2/maipp/tracks:
+    type: vision_msgs/msg/Detection3DArray
+    from_domain: 2
+    to_domain: 1

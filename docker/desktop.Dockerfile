@@ -15,6 +15,8 @@ RUN apt install software-properties-common -y && add-apt-repository universe && 
 RUN apt install ros-humble-desktop -y
 # Detection2DArray for the people-detection subscriber
 RUN apt install ros-humble-vision-msgs -y
+# Cross-domain bridge for the MAIPP robot_1 <-> robot_2 coordination topics
+RUN apt install ros-humble-domain-bridge -y
 
 RUN echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
 

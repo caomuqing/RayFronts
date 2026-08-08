@@ -38,9 +38,14 @@
 # Author: Jon Binney
 
 import sys
+import logging
 
 import numpy as np
 import array
+
+logger = logging.getLogger(__name__)
+# One-shot warning flag for PointCloud2 buffer/geometry mismatches.
+_warned_cloud_geom = False
 
 try:
     import cv2
@@ -202,29 +207,24 @@ nptype_to_pftype = dict((nptype, pftype) for pftype, nptype in type_mappings)
 
 def fields_to_dtype(fields, point_step):
     '''Convert a list of PointFields to a numpy record datatype.
-    '''
-    offset = 0
-    np_dtype_list = []
-    for f in fields:
-        while offset < f.offset:
-            # might be extra padding between fields
-            np_dtype_list.append(
-                ('%s%d' % (DUMMY_FIELD_PREFIX, offset), np.uint8))
-            offset += 1
 
+    Uses explicit field offsets and pins itemsize to point_step, so fields
+    listed out of offset order (common with PCL publishers, e.g.
+    x,y,z,intensity,normal_x,... where intensity sits at a later offset
+    than the normals) and inter-field/trailing padding are all handled.
+    '''
+    names, formats, offsets = [], [], []
+    end = 0
+    for f in fields:
         dtype = pftype_to_nptype[f.datatype]
         if f.count != 1:
             dtype = np.dtype((dtype, f.count))
-
-        np_dtype_list.append((f.name, dtype))
-        offset += pftype_to_nptype[f.datatype].itemsize * f.count
-
-    # might be extra padding between points
-    while offset < point_step:
-        np_dtype_list.append(('%s%d' % (DUMMY_FIELD_PREFIX, offset), np.uint8))
-        offset += 1
-
-    return np_dtype_list
+        names.append(f.name)
+        formats.append(dtype)
+        offsets.append(int(f.offset))
+        end = max(end, int(f.offset) + dtype.itemsize)
+    return np.dtype(dict(names=names, formats=formats, offsets=offsets,
+                         itemsize=max(int(point_step), end)))
 
 def dtype_to_fields(dtype):
     '''Convert a numpy record datatype into a list of PointFields.
@@ -256,20 +256,43 @@ def pointcloud2_to_array(cloud_msg, squeeze=True):
     speed... especially for large point clouds, this will be <much> faster.
     '''
     # construct a numpy record type equivalent to the point type of this cloud
-    dtype_list = fields_to_dtype(cloud_msg.fields, cloud_msg.point_step)
+    dtype = fields_to_dtype(cloud_msg.fields, cloud_msg.point_step)
+
+    # Reconcile the buffer with the record size: some publishers pad rows
+    # (row_step > width * point_step), append trailing bytes, or declare
+    # fields overrunning point_step. Salvage whole points instead of
+    # crashing on np.frombuffer.
+    ps = dtype.itemsize  # == point_step unless fields overran it
+    w, h = int(cloud_msg.width), int(cloud_msg.height)
+    buf = bytes(cloud_msg.data)
+    expected = w * h * ps
+    if len(buf) != expected:
+        global _warned_cloud_geom
+        if not _warned_cloud_geom:
+            _warned_cloud_geom = True
+            logger.warning(
+                "PointCloud2 buffer/geometry mismatch: len(data)=%d, "
+                "width=%d height=%d point_step=%d row_step=%d record=%dB; "
+                "salvaging whole points (warning once).", len(buf), w, h,
+                cloud_msg.point_step, cloud_msg.row_step, ps)
+        rs = int(cloud_msg.row_step)
+        if h >= 1 and rs > w * ps and len(buf) >= h * rs:
+            rows = np.frombuffer(buf[: h * rs], dtype=np.uint8).reshape(h, rs)
+            buf = rows[:, : w * ps].tobytes()
+        elif len(buf) > expected:
+            buf = buf[:expected]
+        else:
+            n = len(buf) // ps
+            buf = buf[: n * ps]
+            w, h = n, 1
 
     # parse the cloud into an array
-    cloud_arr = np.frombuffer(cloud_msg.data, dtype_list)
+    cloud_arr = np.frombuffer(buf, dtype)
 
-    # remove the dummy fields that were added
-    cloud_arr = cloud_arr[
-        [fname for fname, _type in dtype_list if not (
-            fname[:len(DUMMY_FIELD_PREFIX)] == DUMMY_FIELD_PREFIX)]]
-
-    if squeeze and cloud_msg.height == 1:
-        return np.reshape(cloud_arr, (cloud_msg.width,))
+    if squeeze and h == 1:
+        return np.reshape(cloud_arr, (w,))
     else:
-        return np.reshape(cloud_arr, (cloud_msg.height, cloud_msg.width))
+        return np.reshape(cloud_arr, (h, w))
 
 def array_to_pointcloud2(cloud_arr, stamp=None, frame_id=None):
     '''Converts a numpy record array to a sensor_msgs.msg.PointCloud2.

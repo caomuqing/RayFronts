@@ -66,6 +66,16 @@ exploration:
   # Only class voxels within this radius of the frontier are considered as
   # anchor candidates.
   candidate_search_radius: 6.0
+  # Minimum goal altitude in meters above the pose-frame origin (= takeoff
+  # ground level); candidates below it are lifted to it before the view,
+  # safety and LOS checks run. null = no floor (goal height purely
+  # hover_height above each anchor voxel).
+  goal_min_altitude: null
+  # Minimum distance between the robot's current position and a new goal
+  # (candidates closer than this are dropped): every goal commands real
+  # movement, and re-observations of a stubborn frontier come from a
+  # different viewpoint. 0 disables.
+  goal_min_move: 0.0
   # Viewpoint ranking: cost = distance_to_robot + frontier_proximity_weight
   # * horizontal_standoff_to_frontier. 0 = pick whatever is cheapest to
   # reach (drone observes from afar and barely advances); >0 pushes goals
@@ -85,6 +95,11 @@ exploration:
   # state, which improves as space is carved/labeled.
   blacklist_base_ban_s: 15.0
   blacklist_max_ban_s: 240.0
+  # A frontier still alive after this many REACHED observation goals is not
+  # resolving (occluded interior, follower ignoring commanded yaw, stalled
+  # semantics, ...) and gets banned with the backoff above — prevents the
+  # planner from staring at one spot republishing the same goal.
+  frontier_reobserve_limit: 3
   # Region-based hierarchical exploration (MAIPP-style). The semantically
   # unexplored space inside the xy bounds — info-grid cells (grid_cell_size)
   # with no ground/obstacle classification yet — is segmented into
@@ -135,6 +150,14 @@ exploration:
   track_task_min_sigma: 0.8
   track_task_min_unseen_s: 240.0
   track_task_time_budget_s: 60.0
+  # Priority zone [x_min, x_max, y_min, y_max] in the grid/frontier frame
+  # (null entries = unbounded side; null zone disables): tasks whose
+  # centroid / track mean lies inside get task_priority_bonus added to
+  # their utility. With the default bonus (5.0, above any normal score),
+  # in-zone tasks strictly precede out-of-zone ones; use a small bonus
+  # (e.g. 0.5) for a soft preference instead.
+  task_priority_zone: null
+  task_priority_bonus: 15.0
   # ---- Multi-robot MAIPP comms. With robot_id > 0, the planner publishes
   # under /robot_<robot_id>/maipp (all in frontier-frame coordinates):
   #   coverage_grid  nav_msgs/OccupancyGrid  (-1 unknown / 0 ground /

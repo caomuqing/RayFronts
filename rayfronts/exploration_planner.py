@@ -145,6 +145,9 @@ class ExplorationPlanner:
     self.safety_allow_unknown = bool(cfg.get("safety_allow_unknown", False))
     self.frontier_proximity_weight = float(
       cfg.get("frontier_proximity_weight", 0.0))
+    v = cfg.get("goal_min_altitude", None)
+    self.goal_min_altitude = None if v is None else float(v)
+    self.goal_min_move = float(cfg.get("goal_min_move", 0.0))
 
     self.vox_size = float(self.mapper.vox_size)
 
@@ -184,6 +187,11 @@ class ExplorationPlanner:
     self._blacklist = {}
     self.blacklist_base_ban_s = float(cfg.get("blacklist_base_ban_s", 15.0))
     self.blacklist_max_ban_s = float(cfg.get("blacklist_max_ban_s", 240.0))
+    # Ban a frontier after this many REACHED observation goals that failed
+    # to resolve it (prevents staring loops on unresolvable frontiers).
+    self.frontier_reobserve_limit = int(
+      cfg.get("frontier_reobserve_limit", 3))
+    self._reached_counts = {}  # blacklist key -> reached-without-resolve
 
     # Region-based hierarchical exploration (MAIPP-style): segment the
     # semantically unexplored space (info-grid cells never classified)
@@ -216,6 +224,10 @@ class ExplorationPlanner:
       cfg.get("track_task_min_unseen_s", 240.0))
     self.track_task_time_budget_s = float(
       cfg.get("track_task_time_budget_s", 60.0))
+    z = cfg.get("task_priority_zone", None)
+    self.task_priority_zone = (None if z is None else
+                               [None if v is None else float(v) for v in z])
+    self.task_priority_bonus = float(cfg.get("task_priority_bonus", 5.0))
 
     # Multi-robot MAIPP comms (see _setup_comms): coverage grids, person
     # tracks, and task claims exchanged with peers on standard topics
@@ -945,8 +957,17 @@ class ExplorationPlanner:
         i = np.round(xs / g).astype(np.int64) - ix0
         j = np.round(ys / g).astype(np.int64) - iz0
         ok = (i >= 0) & (i < nx) & (j >= 0) & (j < nz)
+        first = rid not in self._peer_cover
         self._peer_cover[rid] = set(
           zip(i[ok].tolist(), j[ok].tolist()))
+        if first:
+          logger.info(
+            "Receiving coverage from robot_%d: %d classified cells "
+            "in bounds (further updates logged at debug level).",
+            rid, len(self._peer_cover[rid]))
+        else:
+          logger.debug("Coverage from robot_%d: %d cells in bounds.",
+                       rid, len(self._peer_cover[rid]))
       elif kind == "tracks":
         self._fuse_peer_tracks(rid, payload)
       else:  # claim
@@ -1264,6 +1285,18 @@ class ExplorationPlanner:
     Returns (best task dict or None, n_region_cands, n_track_cands).
     """
     now = time.time()
+
+    def zone_bonus(x, y):
+      """task_priority_bonus when (x, y) lies in the priority zone."""
+      z = self.task_priority_zone
+      if z is None:
+        return 0.0
+      xmin, xmax, ymin, ymax = z
+      if ((xmin is None or x >= xmin) and (xmax is None or x <= xmax) and
+          (ymin is None or y >= ymin) and (ymax is None or y <= ymax)):
+        return self.task_priority_bonus
+      return 0.0
+
     cands = []
     cell_area = self.grid_cell_size ** 2
     for cells in regions:
@@ -1272,7 +1305,8 @@ class ExplorationPlanner:
       lam = self.target_birth_density * len(cells) * cell_area
       score = (self.task_w_mass * lam
                + self.task_w_prob * (1.0 - math.exp(-lam))
-               - self.task_w_travel * dist)
+               - self.task_w_travel * dist
+               + zone_bonus(cx, cy))
       cands.append((score, dict(type="region", cells=cells,
                                 centroid=(cx, cy), t_start=now)))
     n_region = len(cands)
@@ -1289,7 +1323,8 @@ class ExplorationPlanner:
       score = (self.task_w_exist * p["existence"]
                + self.task_w_cov * float(torch.trace(p["cov"]))
                + self.task_w_stale * (now - p["last_seen"])
-               - self.task_w_travel * dist)
+               - self.task_w_travel * dist
+               + zone_bonus(float(pxy[0]), float(pxy[1])))
       cands.append((score, dict(type="track", track_id=p["track_id"],
                                 t_start=now, start_n_obs=p["n_obs"])))
     if len(cands) == 0:
@@ -1482,6 +1517,20 @@ class ExplorationPlanner:
     # Candidate positions hover_height above the anchors (up = -y).
     cand = anchors.clone()
     cand[:, 1] -= self.hover_height
+    # Altitude floor (pose-frame origin = takeoff ground level): anchors on
+    # low-sitting ground voxels (quantization, lidar under grass) cannot
+    # drag goals below goal_min_altitude. Applied before the view/safety
+    # checks so they evaluate the final position.
+    if self.goal_min_altitude is not None:
+      cand[:, 1] = torch.clamp(cand[:, 1], max=-self.goal_min_altitude)
+    # Require actual movement: candidates closer than goal_min_move to the
+    # robot are dropped, so consecutive goals never park in place and
+    # re-observations happen from a different viewpoint.
+    if self.goal_min_move > 0 and robot_pos is not None:
+      cand = cand[(cand - robot_pos.reshape(1, 3)).norm(dim=-1)
+                  >= self.goal_min_move]
+      if cand.shape[0] == 0:
+        return None
 
     # Keep a good observation standoff from the frontier, and require the
     # frontier's elevation (relative to the camera pitch) to be within the
@@ -1772,6 +1821,20 @@ class ExplorationPlanner:
                   "(%d blacklisted).", ban, len(self._blacklist))
     elif val == GOAL_REACHED:
       logger.info("Goal reported REACHED; planning next goal.")
+      # A frontier that survives several successfully-reached observation
+      # goals is not resolving (occluded interior, follower ignoring yaw,
+      # stalled semantics, ...); ban it with backoff so the planner does
+      # not stare at it forever. Resolved frontiers never come back, so
+      # their counts are just inert.
+      if self._last_goal_key is not None:
+        n = self._reached_counts.get(self._last_goal_key, 0) + 1
+        self._reached_counts[self._last_goal_key] = n
+        if n >= self.frontier_reobserve_limit:
+          ban = self._blacklist_add(self._last_goal_key)
+          self._reached_counts.pop(self._last_goal_key, None)
+          logger.info(
+            "Frontier near %s reached %d times without resolving; banned "
+            "for %.0fs.", str(self._last_goal_key), n, ban)
     self._last_goal_pub_time = None
     self._last_goal_key = None
     return True

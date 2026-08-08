@@ -103,10 +103,19 @@ querying:
   period: 10
 
 exploration:
-  # Elevation-band inflation factor. 1.0 = use the true camera FOV (min
-  # standoff ~1.9m at hover_height 1.2); raise (e.g. 1.3 -> ~1.3m standoff)
-  # to admit closer viewpoints at the cost of the frontier possibly falling
-  # slightly outside the actual image.
+  # Goal viewpoints hover this high above the ground-class anchor voxel.
+  # Note the coupled minimum view standoff: hover_height / tan(32.5deg *
+  # view_fov_scale) — 1.2m -> ~1.9m standoff at true FOV.
+  hover_height: 1.2
+  # Never command goals below this altitude (meters above the odometry
+  # origin, i.e. takeoff ground level): low-sitting ground anchor voxels
+  # (0.3m quantization, lidar returns under grass) cannot drag goals down.
+  goal_min_altitude: 1.0
+  # Each new goal must be at least this far from the current position.
+  goal_min_move: 1.0
+  # Elevation-band inflation factor. 1.0 = use the true camera FOV; raise
+  # (e.g. 1.3) to admit closer viewpoints at the cost of the frontier
+  # possibly falling slightly outside the actual image.
   view_fov_scale: 1.0
   # Goal viewpoints may sit in unobserved air (only observed-occupied voxels
   # reject); the onboard follower's local avoidance covers surprises.
@@ -133,6 +142,9 @@ exploration:
   # (see default.yaml for the protocol).
   robot_id: 2
   peer_robot_ids: [1]
+  # Work the western part of the map first: any task with frame x <= -15
+  # strictly precedes tasks outside that zone.
+  task_priority_zone: [null, -15.0, null, null]
   # 2D information grid (unknown / non-obstacle / obstacle + confidence),
   # built per keyframe from the visible voxels: chosen-class voxels with no
   # other-class voxel beneath them (global-map check) mark non-obstacle;
@@ -156,7 +168,7 @@ exploration:
   ff_map_min_x: -34.86
   ff_map_max_x: 34.33
   ff_map_min_y: -20.09
-  ff_map_max_y: 15.82
+  ff_map_max_y: 7.82
   # Georeference of the Starling's local NED odometry: FILL PER TAKEOFF.
   #   ned_origin_lat/lon/alt: WGS84 position of the odometry origin (where
   #     the drone sat when odometry initialized).
@@ -173,8 +185,8 @@ exploration:
   # frame_x = ned_x, frame_y = -ned_y — the y axis ALWAYS mirrors between
   # the two (NED is z-down with +y right of +x; the frontier frame is
   # ENU-based z-up with +Y left of +X); no heading choice removes that.
-  ned_origin_lat: 40.41350   # 40.41350 N (surveyed takeoff position)
-  ned_origin_lon: -79.94658  # 79.94658 W (west -> negative)
+  ned_origin_lat: 40.41329   # takeoff spot
+  ned_origin_lon: -79.94657  # (79.94657 W -> negative)
   ned_origin_alt: 0.0
   ned_heading_deg: 166.17  # = 90 - ff_heading_deg = 90 - (-76.17)
   # Local-frame fallback bounds (pose frame), used only when the frontier
