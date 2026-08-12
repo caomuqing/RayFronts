@@ -71,6 +71,14 @@ exploration:
   # safety and LOS checks run. null = no floor (goal height purely
   # hover_height above each anchor voxel).
   goal_min_altitude: null
+  # Altitude ceiling (same reference). Candidate viewpoints above it are
+  # dropped — anchors that high are misclassified canopy/roof/wall voxels
+  # or scan outliers, so the drone must not be sent up to observe them.
+  # null = no ceiling.
+  goal_max_altitude: null
+  # Same guard one step earlier: class frontiers above this altitude are
+  # not explorable ground and are ignored outright. null = no ceiling.
+  frontier_max_altitude: null
   # Minimum distance between the robot's current position and a new goal
   # (candidates closer than this are dropped): every goal commands real
   # movement, and re-observations of a stubborn frontier come from a
@@ -158,6 +166,22 @@ exploration:
   # (e.g. 0.5) for a soft preference instead.
   task_priority_zone: null
   task_priority_bonus: 15.0
+  # Low-flyer work-area separation: a candidate task (region or track)
+  # whose nearest point lies within this many meters of a FRESH peer claim
+  # is not selectable; if that blocks every remaining candidate the
+  # planner holds (no goals) until the peer's claim completes or expires,
+  # rather than crowding it. 0 disables. NOTE this separates committed
+  # work areas only, not transit paths — pair with per-robot
+  # flight_levels for the hard vertical safety margin.
+  task_separation_m: 0.0
+  # Robot ids whose claims are exempt from the separation buffer (e.g. the
+  # high-flyer: no collision risk with low-flyers). Exempt robots' claims
+  # still deconflict tasks via the regular claim exclusion.
+  task_separation_exempt: []
+  # Per-robot altitude bands: an entry keyed "robot<id>" (fields
+  # hover_height, goal_min_altitude) overrides the flat values above, so
+  # each low-flyer works at its own level. null = shared flat values.
+  flight_levels: null
   # ---- Multi-robot MAIPP comms. With robot_id > 0, the planner publishes
   # under /robot_<robot_id>/maipp (all in frontier-frame coordinates):
   #   coverage_grid  nav_msgs/OccupancyGrid  (-1 unknown / 0 ground /
@@ -272,6 +296,13 @@ exploration:
   ff_map_max_x: null
   ff_map_min_y: null
   ff_map_max_y: null
+  # No-fly zones: a list of polygons, each a list of surveyed WGS84 corners
+  # [[lat, lon], ...] in order. Zones need not lie inside the map box. No
+  # frontier, info-grid vote, region cell or goal viewpoint may fall inside
+  # one, so the drone is never sent there (it may still observe a zone from
+  # outside — e.g. to re-acquire a person tracked inside it). Requires the
+  # frontier frame (GPS corners are converted with it). null = none.
+  keepout_polygons: null
   # Georeference of the local NED odometry frame: global position of the
   # local-frame origin and the compass azimuth (degrees clockwise from TRUE
   # north) of the local NED +x axis — i.e. the drone's heading when odometry

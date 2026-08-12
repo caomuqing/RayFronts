@@ -80,6 +80,13 @@ GOAL_REACHED = 1
 GOAL_FAILED = 2
 
 
+def _polygon_area(poly):
+  """Shoelace area of an (M, 2) polygon."""
+  x, y = poly[:, 0], poly[:, 1]
+  return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) -
+                         np.dot(y, np.roll(x, -1))))
+
+
 def _wrap_angle(a):
   """Wraps angle(s) to [-pi, pi]."""
   return (a + math.pi) % (2 * math.pi) - math.pi
@@ -147,7 +154,12 @@ class ExplorationPlanner:
       cfg.get("frontier_proximity_weight", 0.0))
     v = cfg.get("goal_min_altitude", None)
     self.goal_min_altitude = None if v is None else float(v)
+    v = cfg.get("goal_max_altitude", None)
+    self.goal_max_altitude = None if v is None else float(v)
+    v = cfg.get("frontier_max_altitude", None)
+    self.frontier_max_altitude = None if v is None else float(v)
     self.goal_min_move = float(cfg.get("goal_min_move", 0.0))
+    self._apply_flight_levels(cfg)
 
     self.vox_size = float(self.mapper.vox_size)
 
@@ -228,6 +240,13 @@ class ExplorationPlanner:
     self.task_priority_zone = (None if z is None else
                                [None if v is None else float(v) for v in z])
     self.task_priority_bonus = float(cfg.get("task_priority_bonus", 5.0))
+    # Low-flyer collision avoidance at the task level: candidates closer
+    # than this to a fresh peer claim are not selectable; when everything
+    # is blocked the planner holds instead of crowding the peer.
+    self.task_separation_m = float(cfg.get("task_separation_m", 0.0))
+    self.task_separation_exempt = set(
+      int(x) for x in (cfg.get("task_separation_exempt", None) or []))
+    self._sep_last_log = 0.0
 
     # Multi-robot MAIPP comms (see _setup_comms): coverage grids, person
     # tracks, and task claims exchanged with peers on standard topics
@@ -397,6 +416,10 @@ class ExplorationPlanner:
     self.frame_active = False
     self.grid_bounds = None
     self.bounds_rdf = None
+    self.keepout_polygons = []   # no-fly zones, (M, 2) each in grid xy
+    self._keepout_cells = None
+    self._keepout_cells_key = None
+    self._keepout_vis_done = False
 
     ff_lat = cfg.get("ff_origin_lat", None)
     # Georeference of the local NED odometry: flat ned_origin_* values,
@@ -450,6 +473,18 @@ class ExplorationPlanner:
       self.frame_active = True
       self.grid_bounds = (float(cfg.ff_map_min_x), float(cfg.ff_map_max_x),
                           float(cfg.ff_map_min_y), float(cfg.ff_map_max_y))
+      # Keepout zones: surveyed WGS84 corner lists -> frame xy. They need
+      # not lie inside the map box. No frontier, info-grid vote, region
+      # cell or goal viewpoint may fall inside one.
+      for zone in (cfg.get("keepout_polygons", None) or []):
+        poly = np.stack(
+          [ff.gps_to_frame(float(c[0]), float(c[1]))[:2] for c in zone])
+        self.keepout_polygons.append(poly)
+        logger.info(
+          "Keepout zone: %d corners, %.0f m^2, frame x [%.1f, %.1f] "
+          "y [%.1f, %.1f].", poly.shape[0], _polygon_area(poly),
+          poly[:, 0].min(), poly[:, 0].max(),
+          poly[:, 1].min(), poly[:, 1].max())
       logger.info(
         "Frontier frame active: origin (%.6f, %.6f) heading %.2fdeg; local "
         "NED origin (%.6f, %.6f) heading %.2fdeg sits at frame (%.1f, %.1f)"
@@ -516,10 +551,10 @@ class ExplorationPlanner:
     return out
 
   def _in_bounds_mask(self, pts):
-    """Boolean mask of RDF points inside the grid-frame bounds box.
+    """Boolean mask of RDF points that are flyable/explorable.
 
-    Exact test in grid xy (the box may be rotated in RDF); all True when
-    unbounded.
+    Exact test in grid xy: inside the bounds box (which may be rotated in
+    RDF) and outside every keepout polygon. All True when unbounded.
     """
     if self.grid_bounds is None:
       return torch.ones(pts.shape[0], dtype=torch.bool, device=pts.device)
@@ -527,7 +562,33 @@ class ExplorationPlanner:
     mnx, mxx, mny, mxy = self.grid_bounds
     mask = ((xy[:, 0] >= mnx) & (xy[:, 0] <= mxx) &
             (xy[:, 1] >= mny) & (xy[:, 1] <= mxy))
+    if self.keepout_polygons and bool(mask.any()):
+      sel = xy[mask].numpy()
+      ok = np.ones(sel.shape[0], dtype=bool)
+      for poly in self.keepout_polygons:
+        ok &= ~points_in_polygon(sel, poly)
+      mask[mask.clone()] = torch.tensor(ok, dtype=torch.bool)
     return mask.to(pts.device)
+
+  def _cells_allowed(self, ix0, iz0, nx, nz):
+    """Boolean [nx, nz] mask of grid cells outside every keepout polygon.
+
+    Cached per grid window (the polygons and the window are static).
+    """
+    if not self.keepout_polygons:
+      return np.ones((nx, nz), dtype=bool)
+    key = (ix0, iz0, nx, nz)
+    if self._keepout_cells_key != key:
+      g = self.grid_cell_size
+      ii, jj = np.meshgrid(np.arange(nx), np.arange(nz), indexing="ij")
+      centers = np.stack([(ii.ravel() + ix0) * g, (jj.ravel() + iz0) * g],
+                         axis=-1)
+      ok = np.ones(centers.shape[0], dtype=bool)
+      for poly in self.keepout_polygons:
+        ok &= ~points_in_polygon(centers, poly)
+      self._keepout_cells = ok.reshape(nx, nz)
+      self._keepout_cells_key = key
+    return self._keepout_cells
 
   # ---------- lifecycle ----------
 
@@ -584,6 +645,31 @@ class ExplorationPlanner:
       _, pose_src = ds._pose_buf[-1]
     pose = torch.tensor(pose_src, dtype=torch.float)
     return g3d.transform_pose_4x4(pose, ds.src2rdf)
+
+  def _apply_flight_levels(self, cfg):
+    """Per-robot vertical separation: a flight_levels entry keyed
+    "robot<id>" overrides hover_height / goal_min_altitude, so low-flyers
+    operate in distinct altitude bands and even unplanned horizontal
+    convergence (e.g. transit crossings) is a vertical miss.
+    """
+    fl = cfg.get("flight_levels", None)
+    rid = int(cfg.get("robot_id", 0))
+    if fl is None or rid <= 0:
+      return
+    entry = fl.get("robot%d" % rid, None)
+    if entry is None:
+      return
+    v = entry.get("hover_height", None)
+    if v is not None:
+      self.hover_height = float(v)
+    v = entry.get("goal_min_altitude", None)
+    if v is not None:
+      self.goal_min_altitude = float(v)
+    logger.info(
+      "Flight level robot_%d: hover %.2fm, min goal altitude %s.",
+      rid, self.hover_height,
+      "none" if self.goal_min_altitude is None
+      else "%.2fm" % self.goal_min_altitude)
 
   def _bl_key(self, p):
     return tuple(torch.round(p / self._bl_grid).long().tolist())
@@ -1205,7 +1291,8 @@ class ExplorationPlanner:
     does not immediately re-select them.
     """
     ix0, iz0, nx, nz = self._region_grid()
-    unknown = np.ones((nx, nz), dtype=bool)
+    # Cells inside a keepout are never explorable.
+    unknown = self._cells_allowed(ix0, iz0, nx, nz).copy()
     for (ix, iz) in self.info_grid.keys():
       i, j = ix - ix0, iz - iz0
       if 0 <= i < nx and 0 <= j < nz:
@@ -1298,9 +1385,42 @@ class ExplorationPlanner:
       existence >= track_task_min_existence, position sigma >=
       track_task_min_sigma, AND unseen for at least track_task_min_unseen_s
       (the empirical re-observation cadence; exploration wins until then).
-    Returns (best task dict or None, n_region_cands, n_track_cands).
+    Separation gate: with task_separation_m > 0, candidates whose nearest
+    point lies within that distance of a FRESH peer claim are not
+    selectable — two low-flyers never commit to neighbouring work areas.
+    Returns (best task dict or None, n_region_cands, n_track_cands,
+    n_blocked_by_separation).
     """
     now = time.time()
+
+    # Fresh peer claim geometries (frame coords) for the separation gate.
+    # Exempted robots (e.g. the high-flyer: no collision risk with
+    # low-flyers) still deconflict via the regular claim exclusion, but do
+    # not trigger the proximity buffer.
+    claim_xy = []
+    if self.task_separation_m > 0:
+      ix0, iz0, _, _ = self._region_grid()
+      g = self.grid_cell_size
+      for rid, c in self._peer_claim.items():
+        if rid in self.task_separation_exempt:
+          continue
+        if now - c["t"] > self.claim_ttl_s:
+          continue
+        if c.get("cells"):
+          arr = np.array(sorted(c["cells"]), dtype=np.float64)
+          claim_xy.append(np.stack([(arr[:, 0] + ix0) * g,
+                                    (arr[:, 1] + iz0) * g], axis=-1))
+        elif c.get("point") is not None:
+          claim_xy.append(np.array([[c["point"][0], c["point"][1]]]))
+
+    def too_close(pts_xy):
+      """True if any candidate point is within task_separation_m of any
+      fresh peer claim point (pts_xy: [N, 2] frame coords)."""
+      for cl in claim_xy:
+        d2 = ((pts_xy[:, None, :] - cl[None, :, :]) ** 2).sum(-1)
+        if float(d2.min()) < self.task_separation_m ** 2:
+          return True
+      return False
 
     def zone_bonus(x, y):
       """task_priority_bonus when (x, y) lies in the priority zone."""
@@ -1314,9 +1434,20 @@ class ExplorationPlanner:
       return 0.0
 
     cands = []
+    n_blocked = 0
     cell_area = self.grid_cell_size ** 2
+    if claim_xy:
+      ix0_, iz0_, _, _ = self._region_grid()
     for cells in regions:
       cx, cy = self._region_centroid(cells)
+      if claim_xy:
+        arr = np.array(sorted(cells), dtype=np.float64)
+        cell_pts = np.stack([(arr[:, 0] + ix0_) * self.grid_cell_size,
+                             (arr[:, 1] + iz0_) * self.grid_cell_size],
+                            axis=-1)
+        if too_close(cell_pts):
+          n_blocked += 1
+          continue
       dist = math.hypot(cx - robot_xy[0], cy - robot_xy[1])
       lam = self.target_birth_density * len(cells) * cell_area
       score = (self.task_w_mass * lam
@@ -1334,6 +1465,10 @@ class ExplorationPlanner:
           self._track_claimed(p)):
         continue
       pxy = self._grid_xy(p["pos"].reshape(1, 3))[0]
+      if claim_xy and too_close(
+          np.array([[float(pxy[0]), float(pxy[1])]])):
+        n_blocked += 1
+        continue
       dist = math.hypot(float(pxy[0]) - robot_xy[0],
                         float(pxy[1]) - robot_xy[1])
       score = (self.task_w_exist * p["existence"]
@@ -1344,9 +1479,9 @@ class ExplorationPlanner:
       cands.append((score, dict(type="track", track_id=p["track_id"],
                                 t_start=now, start_n_obs=p["n_obs"])))
     if len(cands) == 0:
-      return None, 0, 0
+      return None, 0, 0, n_blocked
     best = max(cands, key=lambda c: c[0])
-    return best[1], n_region, len(cands) - n_region
+    return best[1], n_region, len(cands) - n_region, n_blocked
 
   def _task_plan(self, frontiers, robot_pose, class_vox):
     """MAIPP-style task layer over frontier/viewpoint selection.
@@ -1408,10 +1543,21 @@ class ExplorationPlanner:
     if self._task is None:
       regions = self._segment_unknown(unknown)
       robot_xy = self._grid_xy(robot_pos.reshape(1, 3))[0]
-      task, n_r, n_t = self._score_tasks(
+      task, n_r, n_t, n_blocked = self._score_tasks(
         regions, (float(robot_xy[0]), float(robot_xy[1])))
       if task is None:
         self._vis_regions(unknown_set, class_vox)
+        if n_blocked > 0:
+          # Everything left is within task_separation_m of a peer's work
+          # area: hold rather than crowd the peer (their claim completes
+          # or expires within claim_ttl_s).
+          if time.time() - self._sep_last_log > 10.0:
+            self._sep_last_log = time.time()
+            logger.info(
+              "All %d remaining candidates within %.0fm of peer claims; "
+              "holding until the peer finishes.", n_blocked,
+              self.task_separation_m)
+          return frontiers[:0], torch.zeros(0, dtype=torch.long)
         return frontiers, self.rank_frontiers(robot_pose, frontiers)
       self._task = task
       if task["type"] == "region":
@@ -1467,8 +1613,34 @@ class ExplorationPlanner:
         dtype=torch.uint8)
       radii = torch.full((len(cells),), 0.35 * g)
       vis.log_pc(pts, colors, radii, layer="exploration/regions")
+      self._vis_keepout(gy)
     except Exception:
       logger.exception("Failed to visualize exploration regions.")
+
+  def _vis_keepout(self, gy):
+    """Rerun overlay: no-fly cells inside the bounds box (dark red).
+
+    Logged once (the zones and the grid window are static).
+    """
+    if not self.keepout_polygons or self._keepout_vis_done:
+      return
+    vis = getattr(self.server, "vis", None)
+    if vis is None or not hasattr(vis, "log_pc"):
+      return
+    ix0, iz0, nx, nz = self._region_grid()
+    blocked = np.argwhere(~self._cells_allowed(ix0, iz0, nx, nz))
+    if blocked.shape[0] == 0:
+      self._keepout_vis_done = True
+      return
+    g = self.grid_cell_size
+    xy = torch.tensor(
+      [[(int(i) + ix0) * g, (int(j) + iz0) * g] for i, j in blocked],
+      dtype=torch.float)
+    pts = self._grid_xy_to_rdf(xy, gy)
+    colors = torch.tensor([[140, 20, 20]] * xy.shape[0], dtype=torch.uint8)
+    radii = torch.full((xy.shape[0],), 0.35 * g)
+    vis.log_pc(pts, colors, radii, layer="exploration/keepout")
+    self._keepout_vis_done = True
 
   # ---------- core logic (pure given inputs) ----------
 
@@ -1539,6 +1711,21 @@ class ExplorationPlanner:
     # checks so they evaluate the final position.
     if self.goal_min_altitude is not None:
       cand[:, 1] = torch.clamp(cand[:, 1], max=-self.goal_min_altitude)
+    # Altitude ceiling: candidates anchored on voxels far above the ground
+    # (misclassified canopy/roof, scan outliers) would send the drone many
+    # meters up; drop them rather than clamping, since the anchor geometry
+    # itself is suspect (up = -y).
+    if self.goal_max_altitude is not None:
+      cand = cand[cand[:, 1] >= -self.goal_max_altitude]
+      if cand.shape[0] == 0:
+        return None
+    # The goal itself must be flyable: viewpoints stand off from their
+    # frontier, so one observing a frontier just outside a keepout could
+    # otherwise sit inside it.
+    if self.keepout_polygons:
+      cand = cand[self._in_bounds_mask(cand)]
+      if cand.shape[0] == 0:
+        return None
     # Require actual movement: candidates closer than goal_min_move to the
     # robot are dropped, so consecutive goals never park in place and
     # re-observations happen from a different viewpoint.
@@ -1880,6 +2067,14 @@ class ExplorationPlanner:
     # shared map bounds.
     if self.grid_bounds is not None:
       frontiers = frontiers[self._in_bounds_mask(frontiers)]
+      if frontiers.shape[0] == 0:
+        return
+
+    # Altitude ceiling on the frontiers themselves: a ground/grass frontier
+    # many meters up is a misclassification (canopy, roof, wall) or a scan
+    # outlier, not explorable ground (up = -y).
+    if self.frontier_max_altitude is not None:
+      frontiers = frontiers[frontiers[:, 1] >= -self.frontier_max_altitude]
       if frontiers.shape[0] == 0:
         return
 

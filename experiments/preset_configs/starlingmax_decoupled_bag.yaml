@@ -111,6 +111,12 @@ exploration:
   # origin, i.e. takeoff ground level): low-sitting ground anchor voxels
   # (0.3m quantization, lidar returns under grass) cannot drag goals down.
   goal_min_altitude: 1.0
+  # Ceilings against misclassified high "ground"/"grass" (canopy, roofs,
+  # walls) and scan outliers: ignore frontiers above 3m and never command
+  # a goal above 4m. Without these the planner will happily fly to 13m to
+  # observe a "ground" frontier at 12.6m (seen in the field).
+  frontier_max_altitude: 1.5
+  goal_max_altitude: 2.0
   # Each new goal must be at least this far from the current position.
   goal_min_move: 1.0
   # Elevation-band inflation factor. 1.0 = use the true camera FOV; raise
@@ -145,6 +151,19 @@ exploration:
   # Work the western part of the map first: any task with frame x <= -15
   # strictly precedes tasks outside that zone.
   task_priority_zone: [null, -15.0, null, null]
+  # Low-flyer deconfliction: never commit to work within 5m of the other
+  # low-flyer's claimed task; hold when everything left is that close.
+  # NOTE 5m is a compromise: viewpoint overhang (~2m per robot beyond its
+  # region) plus inter-robot georeference error (2-4m) can consume it, so
+  # close encounters remain possible and the followers' local avoidance is
+  # the real safety layer. Both robots fly at the SAME altitude; per-robot
+  # bands remain available via `flight_levels` (see default.yaml) if field
+  # runs show passes that are too close.
+  task_separation_m: 5.0
+  # The buffer applies between the low-flyers only: the high-flyer's
+  # claims deconflict tasks (regular claim exclusion) but pose no
+  # collision risk, so they don't trigger the 12m proximity hold.
+  task_separation_exempt: [1]
   # 2D information grid (unknown / non-obstacle / obstacle + confidence),
   # built per keyframe from the visible voxels: chosen-class voxels with no
   # other-class voxel beneath them (global-map check) mark non-obstacle;
@@ -169,6 +188,15 @@ exploration:
   ff_map_max_x: 34.33
   ff_map_min_y: -20.09
   ff_map_max_y: 7.82
+  # No-fly zone for the starlings (surveyed corners, see
+  # ./bound_coordinates) — the counterpart of the high-flyer's "zone 2".
+  # In frame coords it spans x [-24.4, 0.6], y [-30.9, -10.8], so the part
+  # overlapping our map box (y >= -20.09) is excluded from exploration.
+  keepout_polygons:
+    - - [40.41306, -79.94674]
+      - [40.41312, -79.94652]
+      - [40.41332, -79.94659]
+      - [40.41326, -79.94681]
   # Per-robot georeference of the local NED odometry: FILL PER TAKEOFF.
   # The ned_origins entry matching this run's robot_id wins (the flat
   # ned_origin_* keys in default.yaml remain as a single-robot fallback).
@@ -191,8 +219,8 @@ exploration:
       alt: 0.0
       heading_deg: 166.17  # = 90 - ff_heading_deg = 90 - (-76.17)
     robot3:
-      lat: 40.41339        # FILL: robot_3's own takeoff spot + heading
-      lon: -79.94697       # (currently copies robot2's values)
+      lat: 40.41332        # FILL: robot_3's own takeoff spot + heading
+      lon: -79.94648       # (currently copies robot2's values)
       alt: 0.0
       heading_deg: 166.17
   # Local-frame fallback bounds (pose frame), used only when the frontier
