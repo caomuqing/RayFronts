@@ -1,0 +1,112 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Tree Height: 700
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Cell Size: 5
+      Plane Cell Count: 40
+      Color: 160; 160; 164
+      Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Robot Poses
+      Topic:
+        Value: /viz/poses
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Coverage (per robot)
+      Topic:
+        Value: /viz/coverage
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: People Tracks
+      Topic:
+        Value: /viz/tracks
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Task Claims
+      Topic:
+        Value: /viz/tasks
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Name: R1 Trail
+      Topic:
+        Value: /viz/robot_1/trail
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Color: 31; 119; 180
+      Line Width: 0.1
+      Line Style: Billboards
+      Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Name: R2 Trail
+      Topic:
+        Value: /viz/robot_2/trail
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Color: 255; 127; 14
+      Line Width: 0.1
+      Line Style: Billboards
+      Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Name: R3 Trail
+      Topic:
+        Value: /viz/robot_3/trail
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Color: 44; 160; 44
+      Line Width: 0.1
+      Line Style: Billboards
+      Enabled: true
+      Value: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: frontier_frame
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/SetInitialPose
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 90
+      Focal Point:
+        X: -3
+        Y: -7
+        Z: 0
+      Pitch: 1.2
+      Yaw: 4.71
+    Saved: ~
+Window Geometry:
+  Height: 1000
+  Width: 1600
